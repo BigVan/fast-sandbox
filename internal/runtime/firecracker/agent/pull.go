@@ -14,9 +14,12 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"fast-sandbox/internal/registryconfig"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
+
+	"k8s.io/klog/v2"
 )
 
 // Client pulls published Firecracker artifacts for an image reference into
@@ -121,7 +124,7 @@ func WithDART(base string) Option {
 // rebuild of the same reference (last-writer-wins index) is therefore only
 // picked up after clearing the cache directory or switching to a new tag —
 // the intended trade-off for warm-image preheating.
-func (c *Client) PullImage(ctx context.Context, stateRoot, image string) error {
+func (c *Client) PullImage(ctx context.Context, stateRoot, image string) (resultErr error) {
 	if strings.TrimSpace(image) == "" {
 		return fmt.Errorf("%w: image reference is required", runtimecontract.ErrInvalidConfig)
 	}
@@ -134,6 +137,18 @@ func (c *Client) PullImage(ctx context.Context, stateRoot, image string) error {
 	if err := os.MkdirAll(dir, cacheDirMode); err != nil {
 		return fmt.Errorf("prepare image cache: %w", err)
 	}
+
+	klog.InfoS("firecracker agent pull started", "image", image, "stateRoot", stateRoot)
+	started := time.Now()
+	completed := false
+	defer func() {
+		elapsed := time.Since(started)
+		if completed {
+			klog.InfoS("firecracker agent pull completed", "image", image, "elapsed", elapsed.String())
+			return
+		}
+		klog.ErrorS(resultErr, "firecracker agent pull failed", "image", image, "elapsed", elapsed.String())
+	}()
 
 	index, err := fetchIndex(ctx, c.s3, image)
 	if err != nil {
@@ -173,7 +188,11 @@ func (c *Client) PullImage(ctx context.Context, stateRoot, image string) error {
 			return err
 		}
 	}
-	return commitManifest(dir, payload)
+	if err := commitManifest(dir, payload); err != nil {
+		return err
+	}
+	completed = true
+	return nil
 }
 
 // getArtifact streams one native artifact object. In DART mode the download

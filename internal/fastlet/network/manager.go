@@ -249,6 +249,18 @@ func (m *Manager) Acquire(ctx context.Context, owner Owner) (_ *Slot, resultErr 
 	m.miss.Add(1)
 	recordSlotAcquire("miss")
 	result = "empty"
+	klog.ErrorS(ErrNoCleanSlot, "network slot acquire missed",
+		"sandboxUid", owner.SandboxUID, "capacity", m.config.Capacity, "slotCount", len(m.slots))
+	for _, id := range m.sortedSlotIDsLocked() {
+		slot := m.slots[id]
+		boundOwner := ""
+		if slot.Owner.SandboxUID != "" {
+			boundOwner = slot.Owner.SandboxUID
+		}
+		klog.ErrorS(ErrNoCleanSlot, "slot pool detail",
+			"id", id, "phase", slot.Phase, "owner", boundOwner,
+			"generation", slot.Owner.InstanceGeneration, "createdAt", slot.CreatedAt.Format(time.RFC3339Nano))
+	}
 	return nil, ErrNoCleanSlot
 }
 
