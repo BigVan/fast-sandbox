@@ -64,6 +64,24 @@ func resolveRootfsImage(stateRoot, image string) (string, error) {
 	return path, nil
 }
 
+// verifyRestorableImage verifies the COMPLETE restore set of an image is
+// committed in the local cache: rootfs plus both golden snapshots. This is
+// the single readiness criterion shared by async delivery and EnsureSandbox,
+// so a partially delivered cache (rootfs committed while vmstate/memory are
+// still transferring) never reports ready. Without it, a parked boot worker
+// polls EnsureSandbox in the delivery window, and every attempt acquires a
+// network slot only to release-destroy it on the snapshot check — burning
+// the slot pool faster than replenishment and failing the cold create.
+func verifyRestorableImage(stateRoot, image string) error {
+	if _, err := resolveRootfsImage(stateRoot, image); err != nil {
+		return err
+	}
+	if _, _, err := resolveRestoreSnapshotFiles(stateRoot, image); err != nil {
+		return err
+	}
+	return nil
+}
+
 // listCachedImages returns the converted image references stored under the
 // StateRoot, keyed by their content-addressed cache directory.
 func listCachedImages(stateRoot string) ([]string, error) {

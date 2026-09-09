@@ -49,12 +49,13 @@ type imageDelivery struct {
 	failedAt  time.Time // when the last attempt failed
 }
 
-// DeliverImage implements runtimecontract.ImageDelivery. A cached image
-// reports Delivered without touching the agent. A missing image with no
-// runtime-agent configured is an error (local mode cannot deliver); otherwise
-// one background delivery attempt per image is kept in flight and the image
-// reports Delivering. A recent attempt failure is reported once (sticky
-// window); afterwards the next call starts a fresh attempt.
+// DeliverImage implements runtimecontract.ImageDelivery. An image whose
+// complete restore set is cached reports Delivered without touching the
+// agent. A missing image with no runtime-agent configured is an error (local
+// mode cannot deliver); otherwise one background delivery attempt per image
+// is kept in flight and the image reports Delivering. A recent attempt
+// failure is reported once (sticky window); afterwards the next call starts
+// a fresh attempt.
 func (d *Driver) DeliverImage(_ context.Context, image string) (runtimecontract.ImageDeliveryStatus, error) {
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
@@ -62,7 +63,7 @@ func (d *Driver) DeliverImage(_ context.Context, image string) (runtimecontract.
 	if strings.TrimSpace(image) == "" {
 		return "", fmt.Errorf("%w: image reference is required", ErrInvalidConfig)
 	}
-	if _, err := resolveRootfsImage(stateRoot, image); err == nil {
+	if err := verifyRestorableImage(stateRoot, image); err == nil {
 		d.touchImage(image)
 		return runtimecontract.ImageDelivered, nil
 	}
@@ -110,10 +111,11 @@ func (d *Driver) imageDeliveryLocked(image string) *imageDelivery {
 }
 
 // runImageDeliveryAttempt performs one PinImage pull in the background and
-// records the terminal result on the tracker. Success is verified locally:
-// the agent journal replays a committed PinImage without re-pulling, so a
-// cache purged under a committed pin must surface as a failed attempt (with
-// a diagnosable error) instead of a success that never materializes.
+// records the terminal result on the tracker. Success is verified locally
+// against the complete restore set: the agent journal replays a committed
+// PinImage without re-pulling, so a cache purged under a committed pin must
+// surface as a failed attempt (with a diagnosable error) instead of a
+// success that never materializes.
 func (d *Driver) runImageDeliveryAttempt(image string, entry *imageDelivery) {
 	timeout := d.deliveryAttemptTimeoutSetting()
 	if timeout <= 0 {
@@ -127,8 +129,8 @@ func (d *Driver) runImageDeliveryAttempt(image string, entry *imageDelivery) {
 		d.mu.RLock()
 		stateRoot := d.config.StateRoot
 		d.mu.RUnlock()
-		if _, resolveErr := resolveRootfsImage(stateRoot, image); resolveErr != nil {
-			err = fmt.Errorf("%w: runtime-agent reports %q delivered but no commit point exists in the local cache (cache purged under an idempotent pin?); rebuild the environment or clear the agent journal to re-pull", ErrImageNotReady, image)
+		if resolveErr := verifyRestorableImage(stateRoot, image); resolveErr != nil {
+			err = fmt.Errorf("%w: runtime-agent reports %q delivered but no committed restore set exists in the local cache (cache purged under an idempotent pin?); rebuild the environment or clear the agent journal to re-pull", ErrImageNotReady, image)
 		} else {
 			d.touchImage(image)
 		}
