@@ -6,7 +6,9 @@ FROM golang:1.25-alpine
 # EXPOSE 2345
 
 WORKDIR /workspace
-RUN apk add --no-cache iproute2 iptables e2fsprogs
+# tcpdump: per-slot dataplane diagnosis from inside the fastlet netns
+# (kubectl exec ... -- ip netns exec <slot> tcpdump -i vmtap0)
+RUN apk add --no-cache iproute2 iptables e2fsprogs tcpdump
 COPY .build/linux-amd64/fastlet .
 COPY .build/linux-amd64/sandbox-init /opt/fast-sandbox/bin/sandbox-init
 COPY .build/linux-amd64/sandbox-tunnel /opt/fast-sandbox/bin/sandbox-tunnel
