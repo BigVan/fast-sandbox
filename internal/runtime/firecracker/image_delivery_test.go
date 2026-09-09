@@ -49,7 +49,18 @@ func (m *materializingAgent) PinImage(ctx context.Context, requestID, image stri
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return "", err
 	}
-	return digest, os.WriteFile(filepath.Join(dir, rootfsImageName), []byte("rootfs-image-data"), 0o640)
+	// The real agent commits the complete restore set; a partial commit
+	// (rootfs only) must NOT count as delivered.
+	for name, payload := range map[string]string{
+		rootfsImageName:     "rootfs-image-data",
+		vmstateSnapshotName: "vmstate-snapshot-data",
+		memorySnapshotName:  "memory-snapshot-data",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(payload), 0o640); err != nil {
+			return "", err
+		}
+	}
+	return digest, nil
 }
 
 func (m *materializingAgent) setPinErr(err error) {
@@ -138,7 +149,7 @@ func TestDeliverImageReportsReplayWithoutLocalCommitAsFailure(t *testing.T) {
 		return false
 	}, 5*time.Second, 20*time.Millisecond, "a replay without a local commit point must fail the attempt")
 	require.ErrorIs(t, reported, ErrImageNotReady)
-	require.Contains(t, reported.Error(), "no commit point")
+	require.Contains(t, reported.Error(), "no committed restore set")
 	require.NotZero(t, agent.deliveredPins())
 }
 
@@ -206,4 +217,29 @@ func TestDeliverImageReportsFailureOnceThenRecoversAfterWindow(t *testing.T) {
 		_, resolveErr := resolveRootfsImage(fixture.stateRoot, fixture.sandboxSpec.Spec.Image)
 		return resolveErr == nil
 	}, 5*time.Second, 20*time.Millisecond)
+}
+
+// TestDeliverImagePartialCacheIsNotDelivered: a cache with only the rootfs
+// committed (snapshots still transferring) must keep reporting Delivering and
+// re-attempt delivery, never Delivered — the readiness criterion is the
+// complete restore set, the same one EnsureSandbox's restore path enforces.
+// This is the regression test for the cold-create slot burn: a partial-cache
+// Delivered let the boot worker poll EnsureSandbox, whose post-acquire
+// snapshot check then release-destroyed a network slot per attempt.
+func TestDeliverImagePartialCacheIsNotDelivered(t *testing.T) {
+	fixture := newDriverFixture(t)
+	image := fixture.sandboxSpec.Spec.Image
+	dir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(image))
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, rootfsImageName), []byte("rootfs-image-data"), 0o640))
+
+	// Local mode (no agent): a partial cache is NOT ready, so delivery is
+	// impossible and the call reports ErrImageNotReady — never Delivered.
+	status, err := fixture.driver.DeliverImage(context.Background(), image)
+	require.ErrorIs(t, err, ErrImageNotReady)
+	require.Equal(t, runtimecontract.ImageDeliveryStatus(""), status)
+
+	// The same criterion gates the synchronous create path: a partial cache
+	// parks (or fails in local mode) before any network slot is acquired.
+	require.ErrorIs(t, verifyRestorableImage(fixture.stateRoot, image), ErrImageNotReady)
 }

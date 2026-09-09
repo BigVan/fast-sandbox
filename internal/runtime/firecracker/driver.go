@@ -388,10 +388,15 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// on the node-side pull. Fastlet routes cold creates through the
 	// driver's asynchronous delivery (DeliverImage): the artifact set is
 	// pulled in the background and the Sandbox is booted once the commit
-	// point appears in the local cache. Local mode (no agent socket) keeps
-	// the pre-warmed behavior: a still-missing image reports
+	// point appears in the local cache. The check covers the COMPLETE
+	// restore set (rootfs + vmstate + memory) and runs BEFORE the network
+	// slot is acquired: a partially delivered cache reports
+	// ErrImageNotReady here instead of burning a slot on the restore-path
+	// checks below, so a parked boot worker polling during the delivery
+	// window cannot exhaust the slot pool. Local mode (no agent socket)
+	// keeps the pre-warmed behavior: a still-missing image reports
 	// ErrImageNotReady and the create fails exactly as before.
-	if _, err := resolveRootfsImage(stateRoot, spec.Image); err != nil {
+	if err := verifyRestorableImage(stateRoot, spec.Image); err != nil {
 		return nil, err
 	}
 

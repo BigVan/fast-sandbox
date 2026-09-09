@@ -217,6 +217,19 @@ spec:
               image:
                 description: Image is the OCI image reference to convert.
                 type: string
+              indexKey:
+                description: |-
+                  IndexKey optionally names an additional content-addressed image-index
+                  key the publish stage writes alongside the default sha256(image) key.
+                  Use case: per-template artifact identity — the OpenSandbox server sets
+                  it to the template ID so two templates of the same source image never
+                  alias each other's artifact sets or node caches. The index payload's
+                  image field equals the key it is written under, so pull-side byte
+                  matching works unchanged. The default key stays last-writer-wins for
+                  warmImages and older clients.
+                maxLength: 255
+                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*(/[a-zA-Z0-9._-]+)*(:[a-zA-Z0-9._-]{1,127})?$
+                type: string
               init:
                 description: |-
                   Init is the injected PID 1 path inside the rootfs. The init script

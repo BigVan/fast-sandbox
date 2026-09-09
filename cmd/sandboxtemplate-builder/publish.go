@@ -68,7 +68,7 @@ func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir 
 	// The image index is uploaded last: a consumer that can resolve the
 	// index is guaranteed a complete artifact set (artifacts, checksums,
 	// and manifest are all already in place).
-	if err := publishImageIndex(ctx, aws, args, spec.Image, manifestURI, sha256Of(manifestBytes), spec.Output.Publish); err != nil {
+	if err := publishImageIndex(ctx, aws, args, spec.Image, manifestURI, sha256Of(manifestBytes), spec.Output.Publish, spec.IndexKey); err != nil {
 		return "", err
 	}
 	return manifestURI, nil
@@ -101,25 +101,52 @@ func imageIndexPayload(image, manifestURI, artifactDigest string) ([]byte, error
 	return json.MarshalIndent(document, "", "  ")
 }
 
-// publishImageIndex uploads the image index object under the store root so
-// consumers can resolve the published artifact set from the image reference
-// alone. The index lives outside the per-build digest namespace, so a
-// rebuild of the same image reference atomically moves the pointer.
+// publishImageIndex uploads the image index object(s) under the store root
+// so consumers can resolve the published artifact set from the image
+// reference alone. The index lives outside the per-build digest namespace,
+// so a rebuild of the same image reference atomically moves the pointer.
 //
 // The index key is derived from the raw image reference string and must be
 // byte-identical to the consumer-side reference (SandboxSpec.Image): no
 // normalization, no default tags, no whitespace trimming. Any divergence
 // breaks the addressing chain.
 //
+// When spec.indexKey is set, the same payload is additionally published
+// under that key with the payload image field equal to the key, giving the
+// build an exact, immutable identity: the OpenSandbox server sets it to the
+// template ID, so two templates of the same source image never alias each
+// other's artifact sets or node caches, while the default sha256(image) key
+// stays last-writer-wins for warmImages and older clients.
+//
 // Concurrent builds of the same image reference against the same store
 // root are last-writer-wins: every build is complete before its index is
 // written, so no half-published state is ever observable, but the winner
 // is not deterministic (publishers should serialize per image).
-func publishImageIndex(ctx context.Context, aws string, args []string, image, manifestURI, artifactDigest, storeRoot string) error {
+func publishImageIndex(ctx context.Context, aws string, args []string, image, manifestURI, artifactDigest, storeRoot string, indexKey string) error {
 	if strings.TrimSpace(image) == "" {
 		return fmt.Errorf("publish image index: image reference is required (empty image would collide on the empty-hash index key)")
 	}
-	payload, err := imageIndexPayload(image, manifestURI, artifactDigest)
+	for _, key := range indexKeys(image, indexKey) {
+		if err := publishOneImageIndex(ctx, aws, args, key, manifestURI, artifactDigest, storeRoot); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// indexKeys returns the image-index keys a build publishes under: the raw
+// image reference (default, last-writer-wins) plus the optional exact
+// spec.indexKey identity when set to something else.
+func indexKeys(image, indexKey string) []string {
+	keys := []string{image}
+	if key := strings.TrimSpace(indexKey); key != "" && key != image {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func publishOneImageIndex(ctx context.Context, aws string, args []string, key, manifestURI, artifactDigest, storeRoot string) error {
+	payload, err := imageIndexPayload(key, manifestURI, artifactDigest)
 	if err != nil {
 		return err
 	}
@@ -134,9 +161,9 @@ func publishImageIndex(ctx context.Context, aws string, args []string, image, ma
 	if err := local.Close(); err != nil {
 		return err
 	}
-	key := "index/" + imageIndexKey(image) + ".json"
-	target := strings.TrimRight(storeRoot, "/") + "/" + key
-	return uploadWithRetry(ctx, aws, args, local.Name(), target, key)
+	objectKey := "index/" + imageIndexKey(key) + ".json"
+	target := strings.TrimRight(storeRoot, "/") + "/" + objectKey
+	return uploadWithRetry(ctx, aws, args, local.Name(), target, objectKey)
 }
 
 // publishRetries is how many times a transient upload failure is retried.

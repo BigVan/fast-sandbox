@@ -156,6 +156,19 @@ type SandboxTemplateSpec struct {
 	// +optional
 	Execd string `json:"execd,omitempty"`
 
+	// IndexKey optionally names an additional content-addressed image-index
+	// key the publish stage writes alongside the default sha256(image) key.
+	// Use case: per-template artifact identity — the OpenSandbox server sets
+	// it to the template ID so two templates of the same source image never
+	// alias each other's artifact sets or node caches. The index payload's
+	// image field equals the key it is written under, so pull-side byte
+	// matching works unchanged. The default key stays last-writer-wins for
+	// warmImages and older clients.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*(/[a-zA-Z0-9._-]+)*(:[a-zA-Z0-9._-]{1,127})?$`
+	// +kubebuilder:validation:MaxLength=255
+	// +optional
+	IndexKey string `json:"indexKey,omitempty"`
+
 	// Kernel is the guest kernel to embed; it must be present in the builder
 	// image under this name (the builder image embeds one kernel at build
 	// time via the KERNEL_NAME build arg).
