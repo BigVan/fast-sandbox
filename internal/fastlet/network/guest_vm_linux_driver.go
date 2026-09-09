@@ -68,6 +68,12 @@ func (d *GuestVMNetNSDriver) Prepare(ctx context.Context, slot *Slot) error {
 		// neighbour cache then points slot IPs at random netns and packets
 		// never reach the right one.
 		{"netns", "exec", slot.NetNSName, d.sysctlCommand, "-w", "net.ipv4.conf." + guestVMDefaultTapName + ".proxy_arp=1"},
+		// The kernel queues proxy ARP replies for proxy_delay (default 80
+		// ticks = 800ms) so a real owner could answer first; on this tap the
+		// proxy IS the only answer for the baked gateway, and the guest's
+		// first egress packet (SYN-ACK!) blocks on it — the entire
+		// first-request stall after restore (measured 792ms on vmtap0).
+		{"netns", "exec", slot.NetNSName, d.sysctlCommand, "-w", "net.ipv4.neigh." + guestVMDefaultTapName + ".proxy_delay=0"},
 		{"netns", "exec", slot.NetNSName, d.sysctlCommand, "-w", "net.ipv4.ip_forward=1"},
 	}
 	for _, arguments := range commands {

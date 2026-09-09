@@ -76,6 +76,9 @@ func TestGuestVMNetNSDriverPrepare(t *testing.T) {
 	// and its replies and egress flow through the namespace.
 	require.Contains(t, joined, "ip netns exec ns-1 sysctl -w net.ipv4.conf.vmtap0.proxy_arp=1")
 	require.NotContains(t, joined, "net.ipv4.conf.all.proxy_arp=1")
+	// Proxy ARP replies must not pay the default 800ms proxy_delay: the
+	// guest's first egress packet after restore blocks on the gateway reply.
+	require.Contains(t, joined, "ip netns exec ns-1 sysctl -w net.ipv4.neigh.vmtap0.proxy_delay=0")
 	require.Contains(t, joined, "ip netns exec ns-1 sysctl -w net.ipv4.ip_forward=1")
 	// Faster ARP re-resolution on both namespace devices (the guest resolves
 	// its baked gateway through the proxy-ARP tap; egress resolves the host
