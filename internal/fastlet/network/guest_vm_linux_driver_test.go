@@ -77,6 +77,11 @@ func TestGuestVMNetNSDriverPrepare(t *testing.T) {
 	require.Contains(t, joined, "ip netns exec ns-1 sysctl -w net.ipv4.conf.vmtap0.proxy_arp=1")
 	require.NotContains(t, joined, "net.ipv4.conf.all.proxy_arp=1")
 	require.Contains(t, joined, "ip netns exec ns-1 sysctl -w net.ipv4.ip_forward=1")
+	// Faster ARP re-resolution on both namespace devices (the guest resolves
+	// its baked gateway through the proxy-ARP tap; egress resolves the host
+	// gateway through eth0).
+	require.Contains(t, joined, "ip netns exec ns-1 sysctl -w net.ipv4.neigh.vmtap0.retrans_time_ms=100")
+	require.Contains(t, joined, "ip netns exec ns-1 sysctl -w net.ipv4.neigh.eth0.retrans_time_ms=100")
 	// The forward rules accept the gateway, guest egress and ingress,
 	// reject siblings (only traffic originating from the tap to the private
 	// CIDR), and accept established connections.

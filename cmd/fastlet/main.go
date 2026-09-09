@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
@@ -127,6 +129,17 @@ func main() {
 		configurable.SetRegistryProvider(registryProvider)
 	}
 	if runtimeProfile.UsesFastletNetNS() {
+		tuneNeighborGCThresholds()
+		// The slot CIDR must not overlap any live pod/node route (CNI pod
+		// CIDR, Docker bridge pool, VPC overlay): the slot bridge would
+		// hijack the range and the isolation rules would blackhole it.
+		if err := fastletnetwork.DetectCIDROverlap(ctx,
+			getEnv("FAST_SANDBOX_NETWORK_CIDR", fastletnetwork.DefaultPrivateCIDR),
+			getEnv("FAST_SANDBOX_NETWORK_BRIDGE", fastletnetwork.DefaultBridge),
+			fastletnetwork.ExecRunner{}); err != nil {
+			klog.ErrorS(err, "Fastlet slot CIDR conflicts with live host routes; set FAST_SANDBOX_NETWORK_CIDR to a free range")
+			os.Exit(1)
+		}
 		networkManager, err := newNetworkManager(capacityFromEnvironment(), podUID, runtimeProfile.NetworkMode)
 		if err != nil {
 			klog.ErrorS(err, "Failed to configure Fastlet-owned network")
@@ -197,8 +210,8 @@ func newNetworkManager(capacity int, podUID string, networkMode runtimecatalog.N
 	config := fastletnetwork.DefaultConfig(capacity, podUID)
 	config.PodName = os.Getenv("POD_NAME")
 	config.PodNamespace = os.Getenv("NAMESPACE")
-	config.PrivateCIDR = getEnv("FAST_SANDBOX_NETWORK_CIDR", config.PrivateCIDR)
-	config.Bridge = getEnv("FAST_SANDBOX_NETWORK_BRIDGE", config.Bridge)
+	config.PrivateCIDR = getEnv("FAST_SANDBOX_NETWORK_CIDR", fastletnetwork.DefaultPrivateCIDR)
+	config.Bridge = getEnv("FAST_SANDBOX_NETWORK_BRIDGE", fastletnetwork.DefaultBridge)
 	config.EgressDevice = getEnv("FAST_SANDBOX_NETWORK_EGRESS_DEVICE", "")
 	config.StateRoot = getEnv("FAST_SANDBOX_NETWORK_STATE_ROOT", config.StateRoot)
 	config.NetNSRoot = getEnv("FAST_SANDBOX_NETWORK_NETNS_ROOT", config.NetNSRoot)
@@ -218,6 +231,27 @@ func newNetworkManager(capacity int, podUID string, networkMode runtimecatalog.N
 
 type networkConfigurable interface {
 	SetNetworkManager(*fastletnetwork.Manager)
+}
+
+// tuneNeighborGCThresholds raises the neighbour cache GC thresholds so a
+// full slot pool (plus host peers) does not thrash the ARP cache into
+// constant eviction and re-resolution. Best-effort: fastlet may lack the
+// privilege in restricted environments and slot preparation must not
+// depend on it.
+func tuneNeighborGCThresholds() {
+	for _, tuning := range []struct {
+		name  string
+		value int
+	}{
+		{"net.ipv4.neigh.default.gc_thresh1", 4096},
+		{"net.ipv4.neigh.default.gc_thresh2", 8192},
+		{"net.ipv4.neigh.default.gc_thresh3", 16384},
+	} {
+		argument := fmt.Sprintf("%s=%d", tuning.name, tuning.value)
+		if output, err := exec.Command("sysctl", "-w", argument).CombinedOutput(); err != nil {
+			klog.Warningf("raise %s failed: %v: %s", tuning.name, err, strings.TrimSpace(string(output)))
+		}
+	}
 }
 
 type infraConfigurable interface {

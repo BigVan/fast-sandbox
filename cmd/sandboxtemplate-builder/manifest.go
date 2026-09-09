@@ -91,13 +91,15 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 		},
 		// The guest network baked into the snapshot (clone networking
 		// model): the restored guest owns a static eth0 address/MAC; the
-		// consumer replaces only the host tap via network_overrides.
+		// consumer replaces only the host tap via network_overrides and
+		// validates the MTU against its slot data plane.
 		"guestNetwork": map[string]any{
 			"iface":   "eth0",
 			"mac":     bakedGuestMAC,
 			"ip":      bakedGuestIP,
 			"gateway": bakedGuestGateway,
 			"netmask": bakedGuestNetmask,
+			"mtu":     bakedGuestMTU,
 		},
 		"entrypoint": spec.Entrypoint,
 		"init":       spec.Init,

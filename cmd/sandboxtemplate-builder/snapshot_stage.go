@@ -43,6 +43,11 @@ const (
 	bakedGuestIP      = "172.30.0.3"
 	bakedGuestGateway = "172.30.0.1"
 	bakedGuestNetmask = "255.255.255.0"
+	// bakedGuestMTU is the eth0 MTU frozen into the snapshot: the boot args
+	// set no MTU, so the kernel default applies. Recorded in the manifest so
+	// consumers can validate it against the host-side slot MTU (a mismatch
+	// makes large transfers depend on PMTUD recovery).
+	bakedGuestMTU = 1500
 )
 
 // runSnapshotStage drives a Firecracker VM from cold boot to a validated

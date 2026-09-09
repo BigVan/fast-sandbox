@@ -20,6 +20,13 @@ import (
 
 const currentSlotVersion = 1
 
+// Defaults of the Fastlet slot data plane; exported for callers (fastlet
+// main) that need the same values for pre-flight validation.
+const (
+	DefaultPrivateCIDR = "172.30.0.0/24"
+	DefaultBridge      = "fsb0"
+)
+
 type Config struct {
 	Capacity         int
 	PodUID           string
@@ -39,8 +46,8 @@ type Config struct {
 
 func DefaultConfig(capacity int, podUID string) Config {
 	return Config{
-		Capacity: capacity, PodUID: podUID, PrivateCIDR: "172.30.0.0/24",
-		Bridge: "fsb0", MTU: 1450,
+		Capacity: capacity, PodUID: podUID, PrivateCIDR: DefaultPrivateCIDR,
+		Bridge: DefaultBridge, MTU: 1450,
 		StateRoot: "/run/fast-sandbox/network", NetNSRoot: "/run/netns",
 		HostNetNSRoot: "/run/fast-sandbox/netns", ReplenishTimeout: time.Minute,
 	}
@@ -64,10 +71,10 @@ func NewManager(config Config, driver Driver, store StateStore) (*Manager, error
 		return nil, fmt.Errorf("capacity, Pod UID, network driver, and state store are required")
 	}
 	if config.PrivateCIDR == "" {
-		config.PrivateCIDR = "172.30.0.0/24"
+		config.PrivateCIDR = DefaultPrivateCIDR
 	}
 	if config.Bridge == "" {
-		config.Bridge = "fsb0"
+		config.Bridge = DefaultBridge
 	}
 	if config.MTU <= 0 {
 		config.MTU = 1450
