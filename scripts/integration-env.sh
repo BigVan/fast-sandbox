@@ -62,6 +62,17 @@ FC_VERSION="${FC_VERSION:-v1.16.1}"
 # it from a registry; index/digest16 are keyed by sha256 of this reference).
 SBX_IMAGE="${SBX_IMAGE:-alpine:3.19}"
 EXECD="${EXECD:-opensandbox/execd:1.1.0}"
+
+# Docker Hub is unreachable from many hosts. The docker.io mirror baked into
+# the kind nodes (config/dev/kind-firecracker.yaml) only covers in-cluster
+# containerd pulls; the SandboxTemplate builder fetches the source image with
+# go-containerregistry, which talks straight to the registry named in the
+# reference and ignores containerd/daemon mirrors. So the mirror host has to be
+# spelled into the reference itself. REGISTRY_MIRROR is that host and it only
+# rewrites implicit docker.io references (one that already names a registry is
+# left as is). Set REGISTRY_MIRROR= (empty) on hosts with direct Docker Hub
+# access -- same note as the kind mirror block.
+REGISTRY_MIRROR="${REGISTRY_MIRROR:-docker.m.daocloud.io}"
 ROOTFS_SIZE="${ROOTFS_SIZE:-2Gi}"
 SBX_TEMPLATE="ai-office-sandbox"
 SBX_POOL="firecracker-pool"
@@ -100,6 +111,76 @@ pass() { printf '\033[1;32m[firecracker-integration] PASS\033[0m %s\n' "$*" | te
 fail() { printf '\033[1;31m[firecracker-integration] FAIL\033[0m %s\n' "$*" >&2; exit 1; }
 # highlight() marks a key milestone in the output (bold cyan, not logged).
 highlight() { printf '\033[1;36m%s\033[0m\n' "$*"; }
+
+# --- Go environment (sudo-aware) ----------------------------------------------
+# The environment needs root (kind, loop devices, XFS mount, sysctl), so the
+# script is normally invoked through sudo. sudo resets the environment and root
+# has its own HOME, so `go env` loses the invoking user's module configuration:
+# host builds then fail with "GOPROXY list is not the empty string, but contains
+# no entries", or hang on an unreachable default proxy. Re-export the caller's
+# Go settings so `make images`, `go build` and `go run` behave as they do outside
+# sudo, and hand the resolved proxy to every docker build too (the builder stages
+# compile Go inside the image and never see the host configuration).
+#
+# GOMODCACHE/GOCACHE are deliberately NOT inherited: root writing into the
+# caller's caches leaves root-owned directories that break their later builds.
+# Root re-downloads into its own cache, which persists across runs.
+GO_INHERITED_VARS=(GOPROXY GOSUMDB GOPRIVATE GOINSECURE GOFLAGS)
+
+inherit_go_env() {
+	command -v go >/dev/null || return 0
+	local go_bin name value i
+	local -a values=()
+	go_bin="$(command -v go)"
+	if [[ "$(id -u)" == 0 && -n "${SUDO_USER:-}" ]]; then
+		# `go env` prints one line per requested name, so the indexes line up.
+		mapfile -t values < <(sudo -u "$SUDO_USER" -H "$go_bin" env "${GO_INHERITED_VARS[@]}" 2>/dev/null || true)
+		for i in "${!GO_INHERITED_VARS[@]}"; do
+			name="${GO_INHERITED_VARS[$i]}"
+			value="${values[$i]:-}"
+			# An explicit `sudo NAME=... ./integration-env.sh` keeps priority.
+			[[ -n "${!name:-}" || -z "$value" ]] && continue
+			export "$name=$value"
+			log "inherited $name=$value from $SUDO_USER"
+		done
+	fi
+	value="$("$go_bin" env GOPROXY 2>/dev/null || true)"
+	if [[ -n "$value" ]]; then
+		# `make images` reads DOCKER_BUILD_FLAGS as well; a caller-supplied
+		# --build-arg comes later on the command line and still wins.
+		export DOCKER_BUILD_FLAGS="--build-arg GOPROXY=$value ${DOCKER_BUILD_FLAGS:-}"
+	else
+		log "warning: go env GOPROXY is empty; module downloads will fail unless every module is already cached (fix with: go env -w GOPROXY=...)"
+	fi
+}
+
+# mirror_ref rewrites an implicit Docker Hub reference to go through
+# $REGISTRY_MIRROR (see the REGISTRY_MIRROR comment above). A reference that
+# already names a registry -- a host with a dot or colon before the first '/'
+# (e.g. myreg.io/x, localhost:5000/x) -- is returned unchanged, as is anything
+# when REGISTRY_MIRROR is empty.
+mirror_ref() {
+	local ref="$1"
+	[[ -n "$REGISTRY_MIRROR" ]] || { printf '%s' "$ref"; return; }
+	local first="${ref%%/*}"
+	if [[ "$ref" == */* && "$first" == *[.:]* ]]; then
+		printf '%s' "$ref"; return
+	fi
+	# Docker Hub official images ("alpine:3.19") live under the library/ path.
+	[[ "$ref" == */* ]] || ref="library/$ref"
+	printf '%s/%s' "$REGISTRY_MIRROR" "$ref"
+}
+
+# Route the builder's source images through the mirror. Done once, in place, so
+# the rendered template spec and the published-artifact assertions (which key
+# off SBX_IMAGE) stay consistent.
+apply_registry_mirror() {
+	local image="$SBX_IMAGE" execd="$EXECD"
+	SBX_IMAGE="$(mirror_ref "$SBX_IMAGE")"
+	EXECD="$(mirror_ref "$EXECD")"
+	[[ "$SBX_IMAGE" == "$image" ]] || log "image via mirror: $image -> $SBX_IMAGE"
+	[[ "$EXECD" == "$execd" ]] || log "execd via mirror: $execd -> $EXECD"
+}
 
 # --- milestone + timing ------------------------------------------------------
 # run_stage wraps every task with a numbered milestone banner and records the
@@ -508,10 +589,18 @@ build_images() {
 	(cd "$REPO_ROOT" && make images COMPONENT=janitor >/dev/null)
 	(cd "$REPO_ROOT" && make images COMPONENT=firecracker-runtime-agent >/dev/null)
 	log "building sandboxtemplate-builder image"
-	# DOCKER_BUILD_FLAGS is the same knob `make images` exposes (e.g.
-	# --build-arg GOPROXY=... on hosts without direct module access).
+	# The Dockerfile defaults GOPROXY to proxy.golang.org, which is unreachable
+	# on some hosts. Inherit the host's `go env GOPROXY` (same mirror the rest of
+	# the build uses) so no manual --build-arg is needed. A GOPROXY in
+	# DOCKER_BUILD_FLAGS still wins because it appears later on the command line;
+	# an empty host value is skipped so it never overrides the Dockerfile default.
+	builder_goproxy="$(go env GOPROXY)"
+	builder_goproxy_arg=()
+	if [[ -n "$builder_goproxy" ]]; then
+		builder_goproxy_arg=(--build-arg "GOPROXY=$builder_goproxy")
+	fi
 	# shellcheck disable=SC2086
-	docker build ${DOCKER_BUILD_FLAGS:-} --quiet -t "$IMG_BUILDER" \
+	docker build "${builder_goproxy_arg[@]}" ${DOCKER_BUILD_FLAGS:-} --quiet -t "$IMG_BUILDER" \
 		-f "$REPO_ROOT/build/Dockerfile.sandboxtemplate-builder" "$REPO_ROOT" >/dev/null
 	log "building fastctl (host CLI)"
 	mkdir -p "$WORK/bin"
@@ -2828,6 +2917,12 @@ done
 [[ -n "$ACTION" ]] || usage
 
 mkdir -p "$WORK" "$LOGS_DIR"
+
+# Before any go/make/docker invocation, and after $WORK exists so log() works.
+inherit_go_env
+
+# Route the builder's implicit Docker Hub images through REGISTRY_MIRROR.
+apply_registry_mirror
 
 case "$ACTION" in
 	up)
