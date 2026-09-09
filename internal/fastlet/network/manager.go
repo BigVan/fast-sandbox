@@ -25,6 +25,12 @@ const currentSlotVersion = 1
 const (
 	DefaultPrivateCIDR = "172.30.0.0/24"
 	DefaultBridge      = "fsb0"
+	// DefaultMTU matches the guest eth0 MTU baked into templates (the
+	// kernel default; boot args cannot set MTU), so the default data plane
+	// is MSS-aligned without PMTUD. Overlay deployments must lower it via
+	// FAST_SANDBOX_NETWORK_MTU (the create-time guest MTU warning then
+	// flags the resulting mismatch).
+	DefaultMTU = 1500
 )
 
 type Config struct {
@@ -47,7 +53,7 @@ type Config struct {
 func DefaultConfig(capacity int, podUID string) Config {
 	return Config{
 		Capacity: capacity, PodUID: podUID, PrivateCIDR: DefaultPrivateCIDR,
-		Bridge: DefaultBridge, MTU: 1450,
+		Bridge: DefaultBridge, MTU: DefaultMTU,
 		StateRoot: "/run/fast-sandbox/network", NetNSRoot: "/run/netns",
 		HostNetNSRoot: "/run/fast-sandbox/netns", ReplenishTimeout: time.Minute,
 	}
@@ -77,7 +83,7 @@ func NewManager(config Config, driver Driver, store StateStore) (*Manager, error
 		config.Bridge = DefaultBridge
 	}
 	if config.MTU <= 0 {
-		config.MTU = 1450
+		config.MTU = DefaultMTU
 	}
 	if config.NetNSRoot == "" || config.HostNetNSRoot == "" || config.StateRoot == "" {
 		return nil, fmt.Errorf("state, Fastlet netns, and host netns roots are required")
