@@ -168,6 +168,14 @@ func (d *LinuxNetNSDriver) Destroy(ctx context.Context, slot *Slot) error {
 			result = errors.Join(result, err)
 		}
 	}
+	// The host-side neighbour entry for the slot IP survives the veth: with
+	// the next owner of the reused private address it stays STALE and points
+	// at the dead veth MAC, so frames are flooded to a gone port and dropped
+	// until ARP re-resolves. Remove it eagerly (best-effort: a missing entry
+	// or an unresolvable device is not a destroy failure).
+	if slot.IP != "" && slot.Bridge != "" {
+		_, _ = d.runner.Run(ctx, d.ipCommand, "neigh", "del", slot.IP, "dev", slot.Bridge)
+	}
 	if slot.NetNSName != "" {
 		if err := deleteNetNSWithRetry(ctx, d.runner, d.ipCommand, slot.NetNSName); err != nil && !isMissingNetworkResource(err) {
 			result = errors.Join(result, err)
@@ -191,7 +199,15 @@ func (d *LinuxNetNSDriver) ensureBridge(ctx context.Context, slot *Slot) error {
 		}
 	}
 	_, err := d.runner.Run(ctx, d.ipCommand, "link", "set", slot.Bridge, "up")
-	return err
+	if err != nil {
+		return err
+	}
+	// Faster ARP re-resolution on the shared bridge (default retransmit is
+	// 1 s; a stale neighbour entry then stalls first packets for seconds).
+	// Best-effort: the tuning is a latency optimization and must never fail
+	// slot preparation.
+	_, _ = d.runner.Run(ctx, d.sysctlCommand, "-w", "net.ipv4.neigh."+slot.Bridge+".retrans_time_ms=100")
+	return nil
 }
 
 func (d *LinuxNetNSDriver) ensureEgress(ctx context.Context, slot *Slot) error {

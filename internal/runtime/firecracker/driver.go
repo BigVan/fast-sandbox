@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
@@ -454,10 +456,19 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// comes from the cached manifest guestNetwork; the BakedGuestIP
 	// convention is the fallback for hand-seeded caches. Slots are prepared
 	// before the image is known, so the NAT rules are applied now.
-	guestIP, err := resolveBakedGuestIP(stateRoot, spec.Image, slot)
+	guestIP, guestMTU, err := resolveBakedGuestIP(stateRoot, spec.Image, slot)
 	if err != nil {
 		releaseSlot()
 		return nil, err
+	}
+	if guestMTU > 0 && guestMTU != slot.MTU {
+		// The guest MTU is frozen in the snapshot while the host side (netns
+		// eth0, guest tap) carries the slot MTU. A mismatch relies on
+		// PMTUD for every large transfer: oversized guest frames are dropped
+		// or fragmented until an ICMP needfrag recovers the path, which
+		// surfaces as intermittent network IO stalls.
+		klog.Warningf("baked guest MTU %d differs from slot MTU %d (sandbox %s, image %s); align the template or FAST_SANDBOX_NETWORK_MTU to avoid PMTU-dependent stalls",
+			guestMTU, slot.MTU, identity.SandboxUID, spec.Image)
 	}
 	if err := manager.ApplyGuest(ctx, owner, guestIP); err != nil {
 		releaseSlot()
@@ -856,21 +867,83 @@ func (d *Driver) launchVM(ctx context.Context, plan launchConfig, slot *fastletn
 	return launch(ctx, launcher, plan)
 }
 
-// resolveBakedGuestIP returns the baked guest address of the image: the
-// manifest guestNetwork is authoritative; the BakedGuestIP convention
+// validateManifestGuestNetwork checks the baked guest network of a template
+// against the slot data plane it is restored into. The guest address,
+// gateway, and netmask are frozen in the snapshot while the runtime CIDR
+// comes from the environment: on a mismatch the guest keeps a half-working
+// data plane (its frozen gateway no longer terminates DNS, the baked
+// address escapes the IPAM reservation and can shadow another slot), so the
+// restore must fail loudly instead.
+func validateManifestGuestNetwork(slot *fastletnetwork.Slot, network manifestGuestNetwork) error {
+	prefix, err := netip.ParsePrefix(slot.PrivateCIDR)
+	if err != nil {
+		return fmt.Errorf("%w: parse slot private CIDR %q: %v", ErrInvalidConfig, slot.PrivateCIDR, err)
+	}
+	address, err := netip.ParseAddr(network.IP)
+	if err != nil || !address.Is4() {
+		return fmt.Errorf("%w: invalid baked guest IP %q", ErrInvalidConfig, network.IP)
+	}
+	if !prefix.Contains(address) {
+		return fmt.Errorf("%w: baked guest IP %s is outside the private CIDR %s", ErrInvalidConfig, network.IP, slot.PrivateCIDR)
+	}
+	// The guest-VM IPAM reserves exactly gateway + 2; any other baked
+	// address can be handed to another slot and shadowed by its netns.
+	conventional, err := fastletnetwork.BakedGuestIP(slot)
+	if err != nil {
+		return fmt.Errorf("%w: derive reserved guest address: %v", ErrInvalidConfig, err)
+	}
+	if network.IP != conventional {
+		return fmt.Errorf("%w: baked guest IP %s does not match the reserved address %s (gateway + 2); rebuild the template or align FAST_SANDBOX_NETWORK_CIDR", ErrInvalidConfig, network.IP, conventional)
+	}
+	if network.Gateway != "" && network.Gateway != slot.Gateway {
+		return fmt.Errorf("%w: baked guest gateway %s does not match the runtime gateway %s (guest DNS and proxy-ARP termination break)", ErrInvalidConfig, network.Gateway, slot.Gateway)
+	}
+	if network.Netmask != "" {
+		bits, ok := netmaskBits(network.Netmask)
+		if !ok {
+			return fmt.Errorf("%w: invalid baked guest netmask %q", ErrInvalidConfig, network.Netmask)
+		}
+		if bits != prefix.Bits() {
+			return fmt.Errorf("%w: baked guest netmask %s (/%d) does not match the private CIDR %s (/%d)", ErrInvalidConfig, network.Netmask, bits, slot.PrivateCIDR, prefix.Bits())
+		}
+	}
+	return nil
+}
+
+// netmaskBits converts a dotted IPv4 netmask to its prefix length; it
+// reports false for malformed or non-contiguous masks.
+func netmaskBits(mask string) (int, bool) {
+	address := net.ParseIP(mask)
+	if address == nil || address.To4() == nil {
+		return 0, false
+	}
+	ones, bits := net.IPMask(address.To4()).Size()
+	if ones == 0 || bits != 32 {
+		return 0, false
+	}
+	return ones, true
+}
+
+// resolveBakedGuestIP returns the baked guest address of the image and its
+// recorded MTU (0 when unknown): the manifest guestNetwork is authoritative
+// and validated against the slot data plane; the BakedGuestIP convention
 // (gateway + 2, the builder/E2E prep baked address) is the fallback for
-// hand-seeded caches without a manifest guest network.
-func resolveBakedGuestIP(stateRoot, image string, slot *fastletnetwork.Slot) (string, error) {
-	if guestIP, ok, err := readCachedManifestGuestNetwork(stateRoot, image); err != nil {
-		return "", fmt.Errorf("%w: read cached manifest guest network: %v", ErrImageNotReady, err)
+// hand-seeded caches without a manifest guest network (such caches carry no
+// MTU and are inherently derived from the runtime CIDR).
+func resolveBakedGuestIP(stateRoot, image string, slot *fastletnetwork.Slot) (string, int, error) {
+	if guestNetwork, ok, err := readCachedManifestGuestNetwork(stateRoot, image); err != nil {
+		return "", 0, fmt.Errorf("%w: read cached manifest guest network: %v", ErrImageNotReady, err)
 	} else if ok {
-		return guestIP, nil
+		if err := validateManifestGuestNetwork(slot, guestNetwork); err != nil {
+			return "", 0, err
+		}
+		return guestNetwork.IP, guestNetwork.MTU, nil
 	}
 	guestIP, err := fastletnetwork.BakedGuestIP(slot)
 	if err != nil {
-		return "", fmt.Errorf("%w: derive baked guest IP: %v", ErrInvalidConfig, err)
+		return "", 0, fmt.Errorf("%w: derive baked guest IP: %v", ErrInvalidConfig, err)
 	}
-	return guestIP, nil
+	return guestIP, 0, nil
 }
 
 // prepareInstance assembles the per-instance runtime assets: the writable

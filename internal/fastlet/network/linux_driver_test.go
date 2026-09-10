@@ -56,6 +56,28 @@ func TestLinuxNetNSDriverPrepareBuildsIsolatedNetwork(t *testing.T) {
 	require.Contains(t, joined, "iptables -t nat -A POSTROUTING")
 	require.Contains(t, joined, "ip netns exec fsb-test iptables -A OUTPUT -d 172.30.0.1/32 -j ACCEPT")
 	require.Contains(t, joined, "ip netns exec fsb-test iptables -A OUTPUT -d 172.30.0.0/24 -j REJECT")
+	// The shared bridge gets faster ARP re-resolution so stale neighbour
+	// entries recover in ~100 ms instead of seconds.
+	require.Contains(t, joined, "sysctl -w net.ipv4.neigh.fsb0.retrans_time_ms=100")
+}
+
+func TestLinuxNetNSDriverDestroyRemovesBridgeNeighbour(t *testing.T) {
+	runner := &recordingRunner{}
+	driver := NewLinuxNetNSDriver(LinuxDriverConfig{Runner: runner})
+	slot := &Slot{
+		NetNSName: "fsb-test", HostVeth: "fh123", Bridge: "fsb0",
+		Address: "172.30.0.2/24", IP: "172.30.0.2", PrivateCIDR: "172.30.0.0/24",
+		Gateway: "172.30.0.1", NetNSPath: filepath.Join(t.TempDir(), "netns", "fsb-test"),
+	}
+	require.NoError(t, driver.Destroy(context.Background(), slot))
+
+	joined := strings.Join(runner.commands, "\n")
+	// The bridge neighbour entry for the slot IP must not outlive the veth:
+	// a stale entry keeps forwarding to the dead MAC and drops traffic for
+	// the next owner of the reused private address.
+	require.Contains(t, joined, "ip link delete fh123")
+	require.Contains(t, joined, "ip neigh del 172.30.0.2 dev fsb0")
+	require.Contains(t, joined, "ip netns delete fsb-test")
 }
 
 func TestDefaultRouteDevice(t *testing.T) {

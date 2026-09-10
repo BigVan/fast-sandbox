@@ -20,6 +20,19 @@ import (
 
 const currentSlotVersion = 1
 
+// Defaults of the Fastlet slot data plane; exported for callers (fastlet
+// main) that need the same values for pre-flight validation.
+const (
+	DefaultPrivateCIDR = "172.30.0.0/24"
+	DefaultBridge      = "fsb0"
+	// DefaultMTU matches the guest eth0 MTU baked into templates (the
+	// kernel default; boot args cannot set MTU), so the default data plane
+	// is MSS-aligned without PMTUD. Overlay deployments must lower it via
+	// FAST_SANDBOX_NETWORK_MTU (the create-time guest MTU warning then
+	// flags the resulting mismatch).
+	DefaultMTU = 1500
+)
+
 type Config struct {
 	Capacity         int
 	PodUID           string
@@ -39,8 +52,8 @@ type Config struct {
 
 func DefaultConfig(capacity int, podUID string) Config {
 	return Config{
-		Capacity: capacity, PodUID: podUID, PrivateCIDR: "172.30.0.0/24",
-		Bridge: "fsb0", MTU: 1450,
+		Capacity: capacity, PodUID: podUID, PrivateCIDR: DefaultPrivateCIDR,
+		Bridge: DefaultBridge, MTU: DefaultMTU,
 		StateRoot: "/run/fast-sandbox/network", NetNSRoot: "/run/netns",
 		HostNetNSRoot: "/run/fast-sandbox/netns", ReplenishTimeout: time.Minute,
 	}
@@ -64,13 +77,13 @@ func NewManager(config Config, driver Driver, store StateStore) (*Manager, error
 		return nil, fmt.Errorf("capacity, Pod UID, network driver, and state store are required")
 	}
 	if config.PrivateCIDR == "" {
-		config.PrivateCIDR = "172.30.0.0/24"
+		config.PrivateCIDR = DefaultPrivateCIDR
 	}
 	if config.Bridge == "" {
-		config.Bridge = "fsb0"
+		config.Bridge = DefaultBridge
 	}
 	if config.MTU <= 0 {
-		config.MTU = 1450
+		config.MTU = DefaultMTU
 	}
 	if config.NetNSRoot == "" || config.HostNetNSRoot == "" || config.StateRoot == "" {
 		return nil, fmt.Errorf("state, Fastlet netns, and host netns roots are required")

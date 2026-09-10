@@ -62,30 +62,39 @@ func readCachedManifestMachine(stateRoot, image string) (manifestMachine, bool, 
 	return document.Machine, true, nil
 }
 
-// readCachedManifestGuestNetwork loads the baked guest address from the
-// cached manifest (builder records guestNetwork.ip). It reports false when
-// the manifest is absent or carries no guest network (hand-seeded local
-// cache); the caller falls back to the BakedGuestIP convention.
-func readCachedManifestGuestNetwork(stateRoot, image string) (string, bool, error) {
+// manifestGuestNetwork is the guest network baked into a template snapshot
+// (clone networking model). MTU is 0 for manifests recorded before the field
+// existed (the kernel default was baked implicitly).
+type manifestGuestNetwork struct {
+	IP      string `json:"ip"`
+	Gateway string `json:"gateway"`
+	Netmask string `json:"netmask"`
+	MTU     int    `json:"mtu"`
+}
+
+// readCachedManifestGuestNetwork loads the baked guest network from the
+// cached manifest (builder records guestNetwork.ip, guestNetwork.mtu). It
+// reports false when the manifest is absent or carries no guest network
+// (hand-seeded local cache); the caller falls back to the BakedGuestIP
+// convention.
+func readCachedManifestGuestNetwork(stateRoot, image string) (manifestGuestNetwork, bool, error) {
 	payload, err := os.ReadFile(cachedManifestPath(stateRoot, image))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return "", false, nil
+			return manifestGuestNetwork{}, false, nil
 		}
-		return "", false, err
+		return manifestGuestNetwork{}, false, err
 	}
 	var document struct {
-		GuestNetwork struct {
-			IP string `json:"ip"`
-		} `json:"guestNetwork"`
+		GuestNetwork manifestGuestNetwork `json:"guestNetwork"`
 	}
 	if err := json.Unmarshal(payload, &document); err != nil {
-		return "", false, fmt.Errorf("decode cached manifest: %w", err)
+		return manifestGuestNetwork{}, false, fmt.Errorf("decode cached manifest: %w", err)
 	}
 	if document.GuestNetwork.IP == "" {
-		return "", false, nil
+		return manifestGuestNetwork{}, false, nil
 	}
-	return document.GuestNetwork.IP, true, nil
+	return document.GuestNetwork, true, nil
 }
 
 // validateRestoreMachineConfig validates the Sandbox request against the

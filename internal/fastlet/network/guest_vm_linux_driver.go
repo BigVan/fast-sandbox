@@ -3,8 +3,13 @@ package network
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/netip"
+	"time"
 )
+
+// arpWarmupDialTimeout bounds the warm-up datagram dial in ApplyGuest.
+const arpWarmupDialTimeout = 300 * time.Millisecond
 
 // guestVMDefaultTapName is the fixed tap name of the guest-VM (Firecracker)
 // data plane. The tap lives inside the slot network namespace (the VMM
@@ -63,12 +68,26 @@ func (d *GuestVMNetNSDriver) Prepare(ctx context.Context, slot *Slot) error {
 		// neighbour cache then points slot IPs at random netns and packets
 		// never reach the right one.
 		{"netns", "exec", slot.NetNSName, d.sysctlCommand, "-w", "net.ipv4.conf." + guestVMDefaultTapName + ".proxy_arp=1"},
+		// The kernel queues proxy ARP replies for proxy_delay (default 80
+		// ticks = 800ms) so a real owner could answer first; on this tap the
+		// proxy IS the only answer for the baked gateway, and the guest's
+		// first egress packet (SYN-ACK!) blocks on it — the entire
+		// first-request stall after restore (measured 792ms on vmtap0).
+		{"netns", "exec", slot.NetNSName, d.sysctlCommand, "-w", "net.ipv4.neigh." + guestVMDefaultTapName + ".proxy_delay=0"},
 		{"netns", "exec", slot.NetNSName, d.sysctlCommand, "-w", "net.ipv4.ip_forward=1"},
 	}
 	for _, arguments := range commands {
 		if _, err := d.runner.Run(ctx, d.ipCommand, arguments...); err != nil {
 			return fmt.Errorf("prepare guest-VM namespace tap: %w", err)
 		}
+	}
+	// Faster ARP re-resolution inside the namespace (guest gateway via the
+	// proxy-ARP tap, host gateway via eth0); the default 1 s retransmit
+	// stalls the first guest packets after every restore. Best-effort: the
+	// tuning is a latency optimization and must never fail preparation.
+	for _, device := range []string{guestVMDefaultTapName, "eth0"} {
+		_, _ = d.runner.Run(ctx, d.ipCommand, "netns", "exec", slot.NetNSName,
+			d.sysctlCommand, "-w", "net.ipv4.neigh."+device+".retrans_time_ms=100")
 	}
 	rules := [][]string{
 		// The namespace gateway (bridge address) stays reachable (DNS proxy
@@ -141,6 +160,16 @@ func (d *GuestVMNetNSDriver) ApplyGuest(ctx context.Context, slot *Slot, guestIP
 		if err := checkThenAdd(ctx, d.runner, d.ipCommand, arguments); err != nil {
 			return fmt.Errorf("apply guest NAT rules: %w", err)
 		}
+	}
+	// ARP warm-up: one datagram to the slot IP forces the host bridge to
+	// resolve the address against the netns eth0 (which owns it) right
+	// away, instead of letting the first business packet hit a stale or
+	// incomplete neighbour entry. The netns answers ARP independently of
+	// the VM state; the DNATed datagram itself is dropped until the guest
+	// resumes, which is harmless. Best-effort.
+	if conn, dialErr := net.DialTimeout("udp", net.JoinHostPort(slot.IP, "9"), arpWarmupDialTimeout); dialErr == nil {
+		_, _ = conn.Write([]byte{0})
+		_ = conn.Close()
 	}
 	return nil
 }

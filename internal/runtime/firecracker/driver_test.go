@@ -267,8 +267,9 @@ func (f *driverFixture) prepareCachedImage(t *testing.T, image string) {
 	manifest, err := json.Marshal(map[string]any{
 		"machine": map[string]any{"vcpu": "2", "memory": "1Gi"},
 		// The baked guest address every slot netns translates its slot IP
-		// to (per-clone clone model).
-		"guestNetwork": map[string]any{"iface": "eth0", "mac": "02:00:00:00:00:01", "ip": "172.30.0.9", "gateway": "172.30.0.1", "netmask": "255.255.255.0"},
+		// to (per-clone clone model). Must stay the reserved convention
+		// address (gateway + 2 of the runtime CIDR).
+		"guestNetwork": map[string]any{"iface": "eth0", "mac": "02:00:00:00:00:01", "ip": "172.30.0.3", "gateway": "172.30.0.1", "netmask": "255.255.255.0"},
 	})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), manifest, 0o640))
@@ -433,7 +434,7 @@ func TestEnsureSandboxBootsVM(t *testing.T) {
 	// bound slot records the baked guest address all slots translate to.
 	slot, exists := fixture.manager.Lookup("sandbox-1")
 	require.True(t, exists)
-	require.Equal(t, "172.30.0.9", slot.GuestIP)
+	require.Equal(t, "172.30.0.3", slot.GuestIP)
 
 	calls := fixture.server.recordedCalls()
 	// v1.16 restore: LoadSnapshot is the first (and only pre-boot) API call;
@@ -862,15 +863,83 @@ func TestResolveBakedGuestIPFallsBackWithoutManifest(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, memorySnapshotName), []byte("memory"), 0o640))
 
 	// No manifest: the BakedGuestIP convention (gateway + 2, the baked
-	// address of the builder/E2E prep) is the fallback.
-	guestIP, err := resolveBakedGuestIP(stateRoot, image, &fastletnetwork.Slot{Gateway: "172.30.0.1"})
+	// address of the builder/E2E prep) is the fallback; no MTU is known.
+	guestIP, guestMTU, err := resolveBakedGuestIP(stateRoot, image, &fastletnetwork.Slot{Gateway: "172.30.0.1"})
 	require.NoError(t, err)
 	require.Equal(t, "172.30.0.3", guestIP)
+	require.Zero(t, guestMTU)
+
+	// A manifest without an MTU keeps reporting the baked address only.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(
+		`{"guestNetwork":{"ip":"172.30.0.3"}}`), 0o640))
+	guestIP, guestMTU, err = resolveBakedGuestIP(stateRoot, image, &fastletnetwork.Slot{Gateway: "172.30.0.1", PrivateCIDR: "172.30.0.0/24"})
+	require.NoError(t, err)
+	require.Equal(t, "172.30.0.3", guestIP)
+	require.Zero(t, guestMTU)
+
+	// A manifest with an MTU reports it so callers can validate the slot
+	// data plane against the frozen guest value.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(
+		`{"guestNetwork":{"ip":"172.30.0.3","mtu":1500}}`), 0o640))
+	guestIP, guestMTU, err = resolveBakedGuestIP(stateRoot, image, &fastletnetwork.Slot{Gateway: "172.30.0.1", PrivateCIDR: "172.30.0.0/24"})
+	require.NoError(t, err)
+	require.Equal(t, "172.30.0.3", guestIP)
+	require.Equal(t, 1500, guestMTU)
 
 	// A corrupt manifest fails explicitly instead of silently guessing.
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte("{"), 0o640))
-	_, err = resolveBakedGuestIP(stateRoot, image, &fastletnetwork.Slot{Gateway: "172.30.0.1"})
+	_, _, err = resolveBakedGuestIP(stateRoot, image, &fastletnetwork.Slot{Gateway: "172.30.0.1"})
 	require.Error(t, err)
+}
+
+// TestResolveBakedGuestIPRejectsRuntimeMismatch covers the frozen guest
+// network (manifest) vs runtime CIDR alignment: the manifest is only
+// authoritative when it describes the subnet the slot data plane actually
+// implements.
+func TestResolveBakedGuestIPRejectsRuntimeMismatch(t *testing.T) {
+	stateRoot := t.TempDir()
+	image := "example.com/app:v1"
+	dir := filepath.Join(stateRoot, imageCacheDir, imageKey(image))
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+	slot := &fastletnetwork.Slot{Gateway: "172.30.0.1", PrivateCIDR: "172.30.0.0/24"}
+
+	writeManifest := func(payload string) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(payload), 0o640))
+	}
+
+	// The aligned case (builder convention) passes.
+	writeManifest(`{"guestNetwork":{"ip":"172.30.0.3","gateway":"172.30.0.1","netmask":"255.255.255.0","mtu":1500}}`)
+	guestIP, guestMTU, err := resolveBakedGuestIP(stateRoot, image, slot)
+	require.NoError(t, err)
+	require.Equal(t, "172.30.0.3", guestIP)
+	require.Equal(t, 1500, guestMTU)
+
+	// A baked address outside the runtime CIDR.
+	writeManifest(`{"guestNetwork":{"ip":"10.5.0.3","gateway":"10.5.0.1","netmask":"255.255.255.0"}}`)
+	_, _, err = resolveBakedGuestIP(stateRoot, image, slot)
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.Contains(t, err.Error(), "outside the private CIDR")
+
+	// A baked address inside the CIDR but not the reserved convention
+	// address: the IPAM only reserves gateway+2, any other address can be
+	// allocated to a sibling slot and shadow the guest.
+	writeManifest(`{"guestNetwork":{"ip":"172.30.0.9","gateway":"172.30.0.1"}}`)
+	_, _, err = resolveBakedGuestIP(stateRoot, image, slot)
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.Contains(t, err.Error(), "reserved address")
+
+	// A baked gateway differing from the runtime gateway: guest DNS and
+	// proxy-ARP termination break.
+	writeManifest(`{"guestNetwork":{"ip":"172.30.0.3","gateway":"10.5.0.1"}}`)
+	_, _, err = resolveBakedGuestIP(stateRoot, image, slot)
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.Contains(t, err.Error(), "runtime gateway")
+
+	// A baked netmask differing from the runtime prefix length.
+	writeManifest(`{"guestNetwork":{"ip":"172.30.0.3","gateway":"172.30.0.1","netmask":"255.255.0.0"}}`)
+	_, _, err = resolveBakedGuestIP(stateRoot, image, slot)
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.Contains(t, err.Error(), "netmask")
 }
 
 func TestCloseResetsDriver(t *testing.T) {
