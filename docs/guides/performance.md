@@ -17,6 +17,79 @@ A release claim may be published only with its raw report, command, commit,
 environment, and interpretation. The engineering baseline is retained to explain
 the current architecture and to guide optimization; it is not a release claim.
 
+## Immediate deletion reliability (ACK, 2026-10-11)
+
+The OpenSandbox Python SDK created a cached Alpine sandbox and submitted Delete
+immediately after its normal guest `/ping` readiness check, before closing the
+SDK connection. Each load made 300 attempts, with five-second pauses between
+batches and no warmup or workload retries. All Fastlets ran on one ACK node;
+the lifecycle server, controller, and ingress ran on the other node.
+
+The same template `tpl-eb3ecff9-3121-4e58-b60c-63a16bcdfe1c` was used throughout:
+Alpine 3.19 + execd, 1 vCPU / 2 GiB memory / 2 GiB rootfs. The pool contained
+32 Fastlets with four slots each (128 warm slots). The client had four CPU and
+2 GiB limits, a ten-second HTTP timeout, a 180-second readiness budget, and
+10 ms health polls. SDK version: `1.1.1rc2.dev106+gc7dc78a4.d20261008`.
+The tested runtime source is `277f20d`; the raw report records full commits,
+image digests, template digest, dependencies, and individual attempts.
+
+| Concurrency | Successful creates | Delete accepted | Remaining VM / metadata / test CR | Clean slots after cleanup | Runtime cleanup p50 | Runtime cleanup p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| 10 | 300/300 | 300/300 | 0 / 0 / 0 | 128/128 | 233.9 ms | 394.0 ms |
+| 20 | 300/300 | 300/300 | 0 / 0 / 0 | 128/128 | 402.7 ms | 523.3 ms |
+| 50 | 300/300 | 300/300 | 0 / 0 / 0 | 128/128 | 906.3 ms | 1120.8 ms |
+| 100 | 294/300 | 294/294 | 0 / 0 / 0 | 128/128 | 1435.0 ms | 2259.3 ms |
+
+All **1,194 successfully created sandboxes** had an accepted Delete and a
+matching runtime cleanup record; there were **zero deletion failures and zero
+manual recoveries**. The six failed creations at concurrency 100 were
+`SandboxRateLimitException` responses (HTTP 429 / `CapacityRejected`: all
+candidate Fastlets rejected admission). Their persisted rollback intents also
+converged: no test CR or runtime remained. These six requests are not counted
+as successful creates or deletion failures.
+
+Runtime cleanup timing starts at the Controller's FastPath Delete acknowledgment
+log and ends at the Firecracker driver's completed-delete log, paired by Sandbox
+CR UID. It includes Controller waiting and backend cleanup. It does not measure
+VM exit alone or the time until a replacement clean slot is ready. The Delete
+API remains asynchronous; its response alone is not reclamation proof.
+
+Before and after every case, audits verified zero VM processes, zero runtime
+metadata, zero test CRs, and all 128 slots clean. Physical network checks verified
+no sandbox owner or guest address on those clean slots, no guest DNAT/SNAT rules
+or delivery routes, and no new untracked namespace names. Twenty-three namespace
+path names predated the workload and were preserved. A delayed final inventory
+and network check also passed; a local TLS timeout required retrying that
+read-only check, without rerunning the workload.
+
+This is one warm-pool reliability matrix with batch reclamation pauses, not a
+sustained-throughput or maximum-capacity result. Actual node-loss and storage
+fault injection were not exercised in ACK. The focused Go tests cover deletion
+before status projection, stale projection, failed Delete retry, live-Pod registry
+unavailability, unknown Inspect outcomes, assignment changes concurrent with
+Delete, and delayed Create fencing.
+
+[Raw attempts, cleanup timings, image digests, and inventory evidence](../../test/performance/results/delete-reliability-2026-10-11.json)
+· [SDK probe](../../test/performance/opensandbox_delete_bench.py)
+
+Reproduce against an already cached template, using the recorded SDK:
+
+```bash
+# Export DOMAIN, API_KEY, PROTOCOL, and TEMPLATE_ID for the target environment.
+for concurrency in 10 20 50 100; do
+  N=300 CONCURRENCY="$concurrency" BATCH_PAUSE=5 \
+    RUN_NAME="c$concurrency" REPORT_PATH="c$concurrency.json" \
+    python test/performance/opensandbox_delete_bench.py
+  # Verify physical reclamation and all configured slots before the next load.
+done
+```
+
+The probe exits nonzero when creation or Delete submission fails and retains
+those attempts in its report. Collect global VM/metadata inventories, owned CRs,
+slot gauges, clean-slot state, network rules/routes, and timestamped
+Controller/Fastlet logs separately. An accepted Delete or Ready Pod count cannot
+substitute for these checks.
+
 ## Current engineering baseline
 
 The following measurements were collected on 2026-07-27 while investigating the
