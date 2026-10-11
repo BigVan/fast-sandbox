@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -238,6 +239,17 @@ func (s *Server) acceptCreateIntent(ctx context.Context, plan plannedCreate) (*a
 		// A paused Sandbox is resumed through ResumeSandbox (same identity,
 		// same checkpoint); creating it again would boot a fresh instance.
 		return nil, status.Errorf(codes.FailedPrecondition, "Sandbox %q is paused; call ResumeSandbox to resume it", plan.sandbox.Name)
+	}
+	if existing.DeletionTimestamp != nil {
+		return nil, status.Error(codes.FailedPrecondition, assignment.ErrSandboxDeleting.Error())
+	}
+	// An idempotent retry can encounter an intent written by an older server.
+	// Protect it before allowing another side-effecting runtime operation.
+	if !slices.Contains(existing.Finalizers, assignment.CleanupFinalizer) {
+		existing.Finalizers = append(existing.Finalizers, assignment.CleanupFinalizer)
+		if err := s.K8sClient.Update(ctx, &existing); err != nil {
+			return nil, grpcKubernetesError(err)
+		}
 	}
 	existingEnvelope, err := assignment.AssignmentFromAnnotation(&existing)
 	if err != nil || existingEnvelope == nil {
@@ -1055,6 +1067,7 @@ func sandboxFromCreateRequest(request *fastpathv2.CreateSandboxRequest, bindings
 	return &apiv1alpha2.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: request.RequestId, Namespace: request.Namespace, Labels: labels,
+			Finalizers:  []string{assignment.CleanupFinalizer},
 			Annotations: map[string]string{assignment.AnnotationRequestID: request.RequestId, assignment.AnnotationCreateSpecHash: createSpecHash},
 		},
 		Spec: apiv1alpha2.SandboxSpec{

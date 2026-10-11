@@ -475,3 +475,30 @@ func TestPreferFastletMovesResumeTargetFirst(t *testing.T) {
 	// An already-first candidate is a no-op.
 	require.Equal(t, candidates, preferFastlet(candidates, "fastlet-a", "pod-a"))
 }
+
+func TestRuntimeGoneRequiresExplicitAbsence(t *testing.T) {
+	o, registry, f, sandbox := newHarness(t)
+	sandbox.UID = "sandbox-uid"
+	candidate := placement.FastletInfo{ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1", RuntimeProfileHash: "runtime-a", ResourceProfileHash: "resources-a", InfraRevision: "infra-a"}
+	envelope, err := AssignmentForCandidate(candidate, 1, 1, 1, "runtime-a")
+	require.NoError(t, err)
+	require.NoError(t, assignment.SetAssignmentAnnotation(sandbox, envelope))
+	gone, err := o.RuntimeGone(context.Background(), sandbox)
+	require.ErrorIs(t, err, ErrAssignedFastletUnavailable)
+	require.False(t, gone)
+	registry.fastlets[candidate.ID] = candidate
+	for _, reply := range []*fastletapi.InspectSandboxResponse{nil, {}} {
+		f.inspect = func(string, *fastletapi.InspectSandboxRequest) (*fastletapi.InspectSandboxResponse, error) {
+			return reply, nil
+		}
+		gone, err = o.RuntimeGone(context.Background(), sandbox)
+		require.ErrorIs(t, err, ErrUnknownFastletOutcome)
+		require.False(t, gone)
+	}
+	f.inspect = func(string, *fastletapi.InspectSandboxRequest) (*fastletapi.InspectSandboxResponse, error) {
+		return nil, &fastletapi.FastletError{Code: fastletapi.ErrorNotFound}
+	}
+	gone, err = o.RuntimeGone(context.Background(), sandbox)
+	require.NoError(t, err)
+	require.True(t, gone)
+}

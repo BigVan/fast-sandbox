@@ -51,6 +51,20 @@ recovery timeout. Create defaults to aggregate `Ready`; explicit
 
 ## Delete
 
+Fast-Path persists the cleanup finalizer in the initial CR Create, before
+sending any runtime Create RPC. Idempotent retries protect older intents before
+reusing them. Direct CR creation acquires the same finalizer before assignment.
+The delete API acknowledges durable deletion intent; it does not synchronously
+wait for VM or slot reclamation.
+
+Deletion uses the authoritative assignment annotation, including when placement
+status is empty or stale. The Controller repairs that projection and sends a
+fenced Fastlet Delete **before** testing runtime absence. Fastlet records a
+per-identity tombstone even when Create has not arrived, preventing a delayed
+Create from reviving that identity. Assignment initialization and candidate
+switches stop once the CR has a deletion timestamp; optimistic concurrency
+prevents switching to another Fastlet across that boundary.
+
 Deletion uses a finalizer:
 
 1. mark the local Sandbox Terminating, then attempt Action Binding
@@ -60,6 +74,11 @@ Deletion uses a finalizer:
 4. release network and Infra resources;
 5. retain platform cleanup state and retry on partial failure;
 6. remove the finalizer only when platform resource absence is proven.
+
+A missing registry entry, transport failure, or empty Inspect response is not
+proof of runtime absence and keeps deletion retryable. If the owning Pod identity
+is actually gone, the existing Pod-lifetime contract hands orphan resource
+cleanup to NodeJanitor; a temporarily unavailable live Pod does not qualify.
 
 Missing task, container, snapshot, network, or Infra state is treated as success when the desired state is absence. This makes repeated deletion and deletion after a workload exits idempotent.
 

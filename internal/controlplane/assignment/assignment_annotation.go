@@ -7,12 +7,15 @@ import (
 	"fmt"
 
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 )
 
 const (
+	// CleanupFinalizer protects runtime resources before any Create RPC is sent.
+	CleanupFinalizer          = "sandbox.fast.io/cleanup"
 	AnnotationAssignment      = "sandbox.fast.io/assignment"
 	AssignmentEnvelopeVersion = "v1"
 	// assignmentAnnotationJSONPath is AnnotationAssignment escaped for JSON
@@ -30,6 +33,7 @@ var (
 	ErrAssignmentAnnotationMissing  = errors.New("assignment status exists without assignment annotation")
 	ErrAssignmentProjectionConflict = errors.New("assignment annotation and status projection conflict")
 	ErrAssignmentAnnotationChanged  = errors.New("assignment annotation changed")
+	ErrSandboxDeleting              = errors.New("Sandbox deletion is in progress")
 )
 
 // InitializeAssignmentAnnotation wins the first placement for an existing
@@ -48,6 +52,9 @@ func InitializeAssignmentAnnotation(
 	var current apiv1alpha2.Sandbox
 	if err := k8sClient.Get(ctx, key, &current); err != nil {
 		return nil, false, err
+	}
+	if current.DeletionTimestamp != nil {
+		return nil, false, ErrSandboxDeleting
 	}
 	existing, err := AssignmentFromAnnotation(&current)
 	if err != nil {
@@ -231,34 +238,33 @@ func CASAssignmentAnnotation(
 	if err != nil {
 		return nil, err
 	}
-	var current apiv1alpha2.Sandbox
-	if err := k8sClient.Get(ctx, key, &current); err != nil {
-		return nil, err
-	}
-	currentEnvelope, err := EffectiveAssignment(&current)
-	if err != nil {
-		return nil, err
-	}
-	if currentEnvelope == nil || !assignmentEnvelopeEqual(*currentEnvelope, expected) {
-		return nil, ErrAssignmentAnnotationChanged
-	}
-	currentValue := current.Annotations[AnnotationAssignment]
-	patch, err := json.Marshal([]map[string]any{
-		{"op": jsonPatchTestOp, jsonPatchPathField: assignmentAnnotationJSONPath, jsonPatchValueField: currentValue},
-		{"op": "replace", jsonPatchPathField: assignmentAnnotationJSONPath, jsonPatchValueField: nextValue},
+	var result *apiv1alpha2.Sandbox
+	err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var current apiv1alpha2.Sandbox
+		if err := k8sClient.Get(ctx, key, &current); err != nil {
+			return err
+		}
+		if current.DeletionTimestamp != nil {
+			return ErrSandboxDeleting
+		}
+		currentEnvelope, err := EffectiveAssignment(&current)
+		if err != nil {
+			return err
+		}
+		if currentEnvelope == nil || !assignmentEnvelopeEqual(*currentEnvelope, expected) {
+			return ErrAssignmentAnnotationChanged
+		}
+		before := current.DeepCopy()
+		current.Annotations[AnnotationAssignment] = nextValue
+		// The resourceVersion fence prevents a concurrent deletion from being
+		// followed by a candidate switch. Retry unrelated writes with a fresh read.
+		if err := k8sClient.Patch(ctx, &current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
+			return err
+		}
+		result = current.DeepCopy()
+		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	target := &apiv1alpha2.Sandbox{}
-	target.Namespace, target.Name = key.Namespace, key.Name
-	if err := k8sClient.Patch(ctx, target, client.RawPatch(types.JSONPatchType, patch)); err != nil {
-		return nil, err
-	}
-	if err := k8sClient.Get(ctx, key, &current); err != nil {
-		return nil, err
-	}
-	return current.DeepCopy(), nil
+	return result, err
 }
 
 // RemoveAssignmentAnnotation records the durable intent to stop using an

@@ -45,6 +45,7 @@ type controllerFastlet struct {
 	mu                   sync.Mutex
 	ensureErr            error
 	inspectErr           error
+	deleteErr            error
 	ensurePhase          string
 	runtimes             map[string]string
 	ensureCall           int
@@ -94,6 +95,9 @@ func (f *controllerFastlet) DeleteSandbox(_ context.Context, _ string, request *
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleteCall++
+	if f.deleteErr != nil {
+		return nil, f.deleteErr
+	}
 	delete(f.runtimes, request.Identity.SandboxUID)
 	return &fastletapi.DeleteSandboxResponse{}, nil
 }
@@ -371,8 +375,6 @@ func TestResetDeletesOldRuntimeThenAdvancesGeneration(t *testing.T) {
 	fastlet.runtimes[string(current.UID)] = "running"
 
 	_, err := reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
-	require.NoError(t, err)
-	_, err = reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
 	require.NoError(t, err)
 	current = getControllerSandbox(t, reconciler, sandbox.Name)
 	require.Empty(t, current.Status.Placement.FastletName)
@@ -654,4 +656,88 @@ func TestResumePrefersCheckpointFastlet(t *testing.T) {
 	require.Equal(t, "fastlet-b", current.Status.Placement.FastletName,
 		"resume must prefer the Fastlet that captured the checkpoint")
 	require.Equal(t, types.UID("pod-b"), current.Status.Placement.FastletPodUID)
+}
+
+func TestDeletionUsesAssignmentWhenStatusIsEmptyOrStale(t *testing.T) {
+	for _, state := range []string{"empty", "stale"} {
+		t.Run(state, func(t *testing.T) {
+			reconciler, _, fastlet, sandbox := newControllerHarness(t)
+			current := getControllerSandbox(t, reconciler, sandbox.Name)
+			current.Finalizers = []string{FinalizerName}
+			require.NoError(t, reconciler.Update(context.Background(), current))
+			current = seedReadyControllerAssignment(t, reconciler, getControllerSandbox(t, reconciler, sandbox.Name), apiv1alpha2.PlacementStatus{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1})
+			if state == "empty" {
+				current.Status = apiv1alpha2.SandboxStatus{}
+			} else {
+				current.Status.Placement.Attempt = 5
+			}
+			require.NoError(t, reconciler.Status().Update(context.Background(), current))
+			fastlet.runtimes[string(current.UID)] = "running"
+			require.NoError(t, reconciler.Delete(context.Background(), current))
+			_, err := reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+			require.NoError(t, err)
+			require.Equal(t, 1, fastlet.deleteCall)
+			require.Empty(t, fastlet.runtimes)
+		})
+	}
+}
+
+func TestDeletionKeepsFinalizerWhileLiveFastletIsUnavailable(t *testing.T) {
+	reconciler, registry, fastlet, sandbox := newControllerHarness(t)
+	current := getControllerSandbox(t, reconciler, sandbox.Name)
+	current.Finalizers = []string{FinalizerName}
+	require.NoError(t, reconciler.Update(context.Background(), current))
+	current = seedReadyControllerAssignment(t, reconciler, getControllerSandbox(t, reconciler, sandbox.Name), apiv1alpha2.PlacementStatus{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1})
+	fastlet.runtimes[string(current.UID)] = "running"
+	candidate := registry.fastlets["fastlet-a"]
+	delete(registry.fastlets, "fastlet-a")
+	require.NoError(t, reconciler.Delete(context.Background(), current))
+	result, err := reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+	require.Equal(t, DeletionPollInterval, result.RequeueAfter)
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Contains(t, current.Finalizers, FinalizerName)
+	require.Equal(t, 0, fastlet.deleteCall)
+	registry.fastlets["fastlet-a"] = candidate
+	_, err = reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+	require.Empty(t, fastlet.runtimes)
+}
+
+func TestDeletionDoesNotDropFinalizerOnUnknownInspectOutcome(t *testing.T) {
+	reconciler, _, fastlet, sandbox := newControllerHarness(t)
+	current := getControllerSandbox(t, reconciler, sandbox.Name)
+	current.Finalizers = []string{FinalizerName}
+	require.NoError(t, reconciler.Update(context.Background(), current))
+	current = seedReadyControllerAssignment(t, reconciler, getControllerSandbox(t, reconciler, sandbox.Name), apiv1alpha2.PlacementStatus{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1})
+	fastlet.inspectErr = errors.New("response lost")
+	require.NoError(t, reconciler.Delete(context.Background(), current))
+	_, err := reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+	require.Error(t, err)
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Contains(t, current.Finalizers, FinalizerName)
+	require.Equal(t, 1, fastlet.deleteCall, "Delete must fence a delayed Create before inspecting absence")
+	fastlet.inspectErr = nil
+	_, err = reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+}
+
+func TestDeletionRetriesFailedDeleteWithoutReleasingFinalizer(t *testing.T) {
+	reconciler, _, fastlet, sandbox := newControllerHarness(t)
+	current := getControllerSandbox(t, reconciler, sandbox.Name)
+	current.Finalizers = []string{FinalizerName}
+	require.NoError(t, reconciler.Update(context.Background(), current))
+	current = seedReadyControllerAssignment(t, reconciler, getControllerSandbox(t, reconciler, sandbox.Name), apiv1alpha2.PlacementStatus{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1})
+	fastlet.runtimes[string(current.UID)] = "running"
+	fastlet.deleteErr = errors.New("runtime cleanup failed")
+	require.NoError(t, reconciler.Delete(context.Background(), current))
+	_, err := reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+	require.Error(t, err)
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Contains(t, current.Finalizers, FinalizerName)
+	require.NotEmpty(t, fastlet.runtimes)
+	fastlet.deleteErr = nil
+	_, err = reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+	require.Empty(t, fastlet.runtimes)
 }
