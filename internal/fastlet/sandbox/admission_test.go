@@ -125,7 +125,9 @@ func TestInspectUsesProbeInvalidatedActionStatusBeforeControllerProjection(t *te
 	var liveStatuses []fastletapi.ActionBindingStatus
 	require.Eventually(t, func() bool {
 		liveStatuses, _ = actionManager.Statuses("uid-a")
-		return len(liveStatuses) == 1 && liveStatuses[0].State != "Ready"
+		// The blocked replay keeps Applying stable while Inspect reads it;
+		// Pending may advance between the two reads.
+		return len(liveStatuses) == 1 && liveStatuses[0].State == "Applying"
 	}, 2*time.Second, 10*time.Millisecond)
 
 	inspected, err := manager.InspectSandbox(&fastletapi.InspectSandboxRequest{Identity: fastletapi.SandboxIdentity{
