@@ -17,6 +17,146 @@ A release claim may be published only with its raw report, command, commit,
 environment, and interpretation. The engineering baseline is retained to explain
 the current architecture and to guide optimization; it is not a release claim.
 
+## Master versus deletion-reliability PR (ACK, 2026-10-11)
+
+This comparison pins master to `b702fbe` and PR #99 to `9c0f677`. Both Controller
+and Fastlet images were rebuilt for Linux amd64 from clean source trees, using
+the same base images and build flags. All Pool fields except image digests were
+kept unchanged. The built Fastlet binary checksum is identical across versions;
+production changes are in the Controller. The cached Alpine template,
+1 vCPU / 2 GiB / 2 GiB rootfs,
+32 Fastlets, 128 warm slots, client limits, SDK, HTTP/readiness budgets, and
+health polling match the immediate-deletion setup below. Both Controllers had
+a 1-CPU / 512-MiB limit and the default four Sandbox reconcile workers.
+
+Each version made **600 attempts at each concurrency**, across two 300-attempt
+rounds. The version order was master → PR → PR → master; the first round used
+10 → 20 → 50 → 100, and the second reversed that order. Each ready sandbox was
+deleted immediately, before SDK connection close. Normal batches had five-second
+reclamation pauses; no Create was retried. Every batch began with 128 clean
+network slots. The workload paused on a 15-second slot timeout, preserving the
+failure before test-owned recovery. Recovery used the persisted fenced runtime
+identity and physical inventory checks; those UIDs and failed batches are
+excluded from automatic latency distributions, but included in failure totals.
+
+Runtime times below are **paired completed automatic deletions only**, measured from
+the Controller Delete ACK log to the Firecracker completed-delete log, matched
+by CR UID. They include Controller waiting and runtime cleanup, and exclude
+replacement-slot preparation. An accepted Delete alone is not cleanup proof.
+Physical automatic-cleanup counts are verified independently from log-pair coverage.
+Missing log boundaries have no inferred runtime duration; their identities and
+per-case pairing coverage are retained in raw results. All times are milliseconds;
+percentile method is nearest rank.
+
+| Concurrency | Master creates | PR creates | Master automatic cleanup / accepted | PR automatic cleanup / accepted | Master automatic runtime p50 / p99 | PR automatic runtime p50 / p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| 10 | 600/600 | 600/600 | 600/600 | 600/600 | 241.7 / 407.5 | 244.6 / 396.1 |
+| 20 | 600/600 | 600/600 | 578/600 | 600/600 | 409.6 / 548.5 | 433.1 / 553.1 |
+| 50 | 600/600 | 600/600 | 449/600 | 600/600 | 707.8 / 1130.5 | 988.3 / 1241.8 |
+| 100 | 586/600 | 597/600 | 398/586 | 597/597 | 969.3 / 1640.6 | 1509.7 / 2036.2 |
+
+Runtime latency coverage: 2023/2025 automatic outcomes for master and
+2396/2397 for the PR. Missing boundaries are listed per case and excluded
+from runtime percentiles.
+
+Slot recovery is a **batch measurement**: from the last SDK Delete acceptance
+to the first of two consecutive direct-metric samples showing every Fastlet
+with four clean and zero used slots. No new Create runs during observation.
+The reported time is a sampled upper bound, rather than a per-sandbox slot span.
+Failed batches have no automatic recovery time; “—” does not mean zero latency.
+Runtime and slot percentiles use different units and cannot be subtracted to
+estimate the replacement-slot preparation duration.
+
+| Concurrency | Master restored batches | PR restored batches | Master slot p50 / p99 | PR slot p50 / p99 | Manually cleaned VMs: master / PR |
+|---|---:|---:|---:|---:|---:|
+| 10 | 60/60 | 60/60 | 716.0 / 839.0 | 703.9 / 847.0 | 0 / 0 |
+| 20 | 18/30 | 30/30 | 1365.7 / 1386.5 | 1366.3 / 1388.1 | 22 / 0 |
+| 50 | 0/12 | 12/12 | — / — | 2719.3 / 2996.7 | 151 / 0 |
+| 100 | 0/6 | 6/6 | — / — | 3509.9 / 4961.7 | 188 / 0 |
+
+Creation and Delete API acceptance remain separate measurements:
+
+| Concurrency | Create readiness p50: master / PR | Delete acceptance p50: master / PR |
+|---|---:|---:|
+| 10 | 121.7 / 122.3 | 19.8 / 19.4 |
+| 20 | 195.6 / 192.7 | 25.6 / 23.6 |
+| 50 | 407.0 / 419.6 | 28.6 / 27.7 |
+| 100 | 711.8 / 787.3 | 25.5 / 21.5 |
+
+The fix restores reliable automatic reclamation, but a blanket **“no latency
+regression” conclusion is not justified**. At concurrency 10, runtime p50 changed
+from 241.7 to 244.6 ms (+1.2%), p99 from 407.5 to 396.1 ms, and slot p50 from
+716.0 to 703.9 ms. The batch-mean relative-change 95% bootstrap intervals include
+zero: runtime −1.0% to +5.0%, slot −4.0% to +2.1%. No clear slowdown was detected
+at this load; this is not a formal equivalence test, and one master runtime
+log boundary was unavailable. At concurrency 20, the completed runtime mean
+weighted by VM rose 1.7%; the batch-mean estimate is +2.0% (conditional interval
+−2.2% to +6.3%). Master required intervention
+for 22 VMs and restored only 18/30 batches automatically, so that latency
+comparison is conditional.
+
+At concurrency 50 and 100, **paired automatic runtime p50 increased 39.6% and
+55.8%**. Completed runtime means weighted by VM rose 29.3% and 43.9%. The corresponding
+equally weighted batch-mean estimates are +31.3% and +45.8%, with conditional
+bootstrap intervals of +21.1% to +42.8% and +30.7% to +61.3%. These are
+observed latency increases and must not be presented as latency-neutral.
+However, master completed only 449/600 and 398/586 accepted deletions without
+intervention, and restored 0/12 and 0/6 complete batches within 15 seconds.
+The PR automatically cleaned 600/600 and 597/597, restoring every batch with
+slot p50 of 2.72 and 3.51 seconds. Master's selected successful subset is a
+different automatic cleanup workload; this experiment cannot isolate the
+additional Controller checks from queue waiting and the work of reclaiming
+more VMs. The Fastlet binary is identical, and Controller waiting is included
+in the runtime metric. Controller queueing and the larger reclaimed workload
+are possible contributors, not separately measured bottlenecks.
+
+Across all loads, the PR automatically reclaimed **2,397/2,397 created VMs**
+and restored **108/108 batches**, with zero manual recoveries. Master reclaimed
+2,025/2,386 without intervention, with **361 manual recoveries and 30/108 batch
+restoration timeouts**. All recorded manual completion logs follow the
+intervention request. The reliability improvement is established for this
+warm idle/health-check workload; the high-concurrency latency cost remains
+unisolated, and these results do not establish a latency-neutral release claim.
+
+The failed master samples must not be hidden when interpreting performance.
+Master's successful-cleanup subset does less automatic reclamation than the PR
+workload; a lower median in that subset cannot establish faster end-to-end
+cleanup or isolate the cost of the additional safety checks. Completed runtime
+and batch distributions, per-round values, batch-bootstrap conditional estimates,
+and every failed/recovered UID are retained in the raw report. Runtime
+comparisons with interventions or missing boundaries use subsets.
+Concurrency 10 has complete pool-restoration coverage across all 60 batches
+per version; its runtime coverage is 599/600 for master and 600/600 for the PR.
+
+Before the formal rounds, an initial master concurrency-20 batch left one VM,
+one runtime metadata record, and one used slot despite all Delete responses
+succeeding and the CR disappearing. It had not recovered after 120 seconds.
+That calibration failure and its test-owned cleanup are retained separately,
+with the preceding concurrency-10 results; neither is included in the formal
+comparison. The subsequent 15-second observation budget was applied to both
+versions, without rewriting or rerunning those recorded calibration requests.
+
+After every formal case, physical checks verified zero VM processes, zero
+runtime metadata, zero test CRs, all 128 slots clean, and no guest NAT/delivery
+routes or new untracked namespace names. For master, these checks include
+explicitly recorded test-owned recovery. Existing namespace names and the
+unrelated stopped Sandbox were preserved. The PR images were restored after
+the comparison. Real node/storage faults and resource-stress workloads were
+not exercised. There are only six batches per version at concurrency 100;
+the observed p99 is the sample maximum and should not be read as a stable tail.
+
+[Summary, source/image digests, conditional estimates, and links to all 16 raw cases](../../test/performance/results/delete-comparison-2026-10-11/summary.json)
+· [Comparison SDK probe](../../test/performance/opensandbox_delete_compare.py)
+
+The probe requires `TARGETS_FILE` containing the 32 Fastlet Pod names, UIDs,
+and IPs, in addition to the SDK connection/template settings used below.
+`SLOT_POLL_INTERVAL=0.1` and `SLOT_TIMEOUT=15` define observation. By default it
+stops on a failed reclamation batch. The controlled comparison enabled the
+`ALLOW_MANUAL_RECOVERY=1` checkpoint hook: an operator records the failed sample,
+cleans only verified test-owned identities, proves physical reclamation, and
+writes the matching resume receipt before the probe continues. This hook is
+benchmark orchestration, not a change to platform Delete semantics.
+
 ## Immediate deletion reliability (ACK, 2026-10-11)
 
 The OpenSandbox Python SDK created a cached Alpine sandbox and submitted Delete
