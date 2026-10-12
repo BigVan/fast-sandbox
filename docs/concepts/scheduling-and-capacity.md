@@ -112,7 +112,9 @@ runtime outcome.
 The colocated Fast-Path and Controller share a process-local active-create
 tracker, acquired before persisting the intent and released when the RPC exits.
 Reconciliation continues projecting the annotation into status while an RPC
-is active, but defers runtime ensure/reassignment until the RPC releases it.
+is active, but defers status-based Pod-loss recovery and runtime
+ensure/reassignment until the RPC releases it. A deleted or replaced previous
+Fastlet Pod cannot prevent the new assignment from being projected.
 This avoids competing candidate switches in the same process without another
 Kubernetes write. Declarative-only reconciliation and crash recovery remain
 unchanged. Separate processes do not share this tracker; the durable CAS and

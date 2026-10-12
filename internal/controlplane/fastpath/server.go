@@ -357,6 +357,9 @@ func (s *Server) advanceCreateAssignment(ctx context.Context, accepted *accepted
 		if ctx.Err() != nil {
 			return status.FromContextError(ctx.Err()).Err()
 		}
+		if errors.Is(err, assignment.ErrAssignmentProjectionConflict) {
+			return status.Errorf(codes.Aborted, "assignment status projection did not converge: %v", err)
+		}
 		return status.Errorf(codes.Aborted, "assignment changed concurrently: %v", err)
 	}
 	accepted.sandbox, accepted.assignment = sandbox, next

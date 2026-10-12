@@ -151,8 +151,10 @@ measures the bounded wait used only when a rejected candidate's current durable
 assignment has not yet been projected into status. Logs record the Sandbox,
 expected attempt and route generation, wait duration, and final error. The
 complete annotation is compared before status; a real assignment change aborts
-immediately. This stage is included in Create RPC latency, not Firecracker
-runtime stage latency. Absent samples mean no projection wait occurred.
+immediately. An exhausted projection wait returns `Aborted` with
+`assignment status projection did not converge`, distinguishing it from
+`assignment changed concurrently`. This stage is included in Create RPC latency,
+not Firecracker runtime stage latency. Absent samples mean no projection wait occurred.
 
 The colocated Controller still projects status during an active Fast-Path
 Create, but defers runtime ensure/reassignment using a process-local tracker.

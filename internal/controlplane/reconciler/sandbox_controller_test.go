@@ -677,3 +677,69 @@ func TestActiveFastPathCreateProjectsStatusAndDefersRuntimeUntilRelease(t *testi
 	require.Equal(t, 1, fastlet.ensureCall)
 	fastlet.mu.Unlock()
 }
+
+func TestActiveFastPathCreateProjectsAssignmentAfterPreviousPodLoss(t *testing.T) {
+	for _, replaced := range []bool{false, true} {
+		name := "deleted"
+		if replaced {
+			name = "replaced"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			reconciler, registry, fastlet, sandbox := newControllerHarness(t)
+			key := client.ObjectKeyFromObject(sandbox)
+			release := reconciler.Orchestrator.BeginFastPathCreate(key)
+			defer release()
+			reconcileTwice(t, reconciler, sandbox.Name)
+			current := getControllerSandbox(t, reconciler, sandbox.Name)
+			previous, err := assignment.EffectiveAssignment(current)
+			require.NoError(t, err)
+			require.NotNil(t, previous)
+
+			candidate := registry.candidates[0]
+			candidate.ID, candidate.PodName, candidate.PodUID, candidate.PodIP = "fastlet-b", "fastlet-b", "pod-b", "10.0.0.2"
+			registry.fastlets[candidate.ID] = candidate
+			next, err := orchestration.AssignmentForCandidate(candidate, previous.Attempt+1, previous.InstanceGeneration, previous.RouteGeneration+1, "runtime-b")
+			require.NoError(t, err)
+			_, err = assignment.CASAssignmentAnnotation(ctx, reconciler.Client, key, *previous, next)
+			require.NoError(t, err)
+
+			var pod corev1.Pod
+			require.NoError(t, reconciler.Get(ctx, types.NamespacedName{Namespace: sandbox.Namespace, Name: previous.FastletName}, &pod))
+			require.NoError(t, reconciler.Delete(ctx, &pod))
+			if replaced {
+				replacement := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+					Namespace: sandbox.Namespace, Name: previous.FastletName, UID: "replacement-pod",
+				}}
+				require.NoError(t, reconciler.Create(ctx, replacement))
+			}
+			target := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Namespace: sandbox.Namespace, Name: candidate.PodName, UID: types.UID(candidate.PodUID),
+			}}
+			require.NoError(t, reconciler.Create(ctx, target))
+
+			result, err := reconciler.Reconcile(ctx, requestFor(sandbox.Name))
+			require.NoError(t, err)
+			require.Equal(t, ObservationPollInterval, result.RequeueAfter)
+			current = getControllerSandbox(t, reconciler, sandbox.Name)
+			projected, err := assignment.EffectiveAssignment(current)
+			require.NoError(t, err, "previous Pod loss must not block the active create's assignment projection")
+			require.Equal(t, &next, projected)
+			require.Nil(t, current.Status.Placement.Recovery)
+			fastlet.mu.Lock()
+			require.Equal(t, 0, fastlet.ensureCall)
+			fastlet.mu.Unlock()
+
+			release()
+			_, err = reconciler.Reconcile(ctx, requestFor(sandbox.Name))
+			require.NoError(t, err)
+			current = getControllerSandbox(t, reconciler, sandbox.Name)
+			require.Equal(t, apiv1alpha2.RuntimeReady, current.Status.Runtime.State)
+			require.Equal(t, candidate.PodName, current.Status.Placement.FastletName)
+			require.Nil(t, current.Status.Placement.Recovery)
+			fastlet.mu.Lock()
+			require.Equal(t, 1, fastlet.ensureCall)
+			fastlet.mu.Unlock()
+		})
+	}
+}

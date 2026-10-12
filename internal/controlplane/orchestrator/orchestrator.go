@@ -749,10 +749,6 @@ func IsCandidateRejection(err error) bool {
 	}
 }
 
-func (o *Orchestrator) RecordCandidateFeedback(id placement.FastletID, err error) {
-	o.recordFeedback(id, err)
-}
-
 func (o *Orchestrator) recordFeedback(id placement.FastletID, err error) {
 	var failure *fastletapi.FastletError
 	if !errors.As(err, &failure) {

@@ -123,6 +123,7 @@ func TestProjectionWaitStopsOnChangedAssignment(t *testing.T) {
 	_, err := server.CreateSandbox(context.Background(), createRequest("projection-changed"))
 	require.Equal(t, codes.Aborted, status.Code(err))
 	require.Contains(t, err.Error(), assignment.ErrAssignmentAnnotationChanged.Error())
+	require.Contains(t, err.Error(), "assignment changed concurrently")
 	require.Equal(t, []string{"10.0.0.1", "10.0.0.2"}, fastlet.createIPs)
 	require.Equal(t, 3, lag.reads[2], "a changed annotation must not be polled as a lagging projection")
 }
@@ -142,6 +143,7 @@ func TestProjectionWaitIsBoundedAndRetainsIntent(t *testing.T) {
 	_, err := server.CreateSandbox(context.Background(), createRequest("projection-stalled"))
 	require.Equal(t, codes.Aborted, status.Code(err))
 	require.Contains(t, err.Error(), assignment.ErrAssignmentProjectionConflict.Error())
+	require.Contains(t, err.Error(), "assignment status projection did not converge")
 	require.Less(t, time.Since(start), 3*time.Second)
 	require.Equal(t, []string{"10.0.0.1", "10.0.0.2"}, fastlet.createIPs)
 	var persisted apiv1alpha2.Sandbox
