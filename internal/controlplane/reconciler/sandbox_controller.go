@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	FinalizerName           = "sandbox.fast.io/cleanup"
+	FinalizerName           = assignment.CleanupFinalizer
 	DefaultRequeueInterval  = 5 * time.Second
 	ReadyRequeueInterval    = 30 * time.Second
 	DeletionPollInterval    = time.Second
@@ -378,6 +378,9 @@ func (r *SandboxReconciler) reconcileDeletion(ctx context.Context, orchestrator 
 		if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), &current); err != nil {
 			return client.IgnoreNotFound(err)
 		}
+		if current.UID != sandbox.UID || current.Annotations[assignment.AnnotationAssignment] != sandbox.Annotations[assignment.AnnotationAssignment] {
+			return assignment.ErrAssignmentAnnotationChanged
+		}
 		controllerutil.RemoveFinalizer(&current, FinalizerName)
 		return r.Update(ctx, &current)
 	})
@@ -438,8 +441,32 @@ func (r *SandboxReconciler) reconcileReset(ctx context.Context, orchestrator *or
 }
 
 func (r *SandboxReconciler) ensureRuntimeDeleted(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox) (bool, error) {
-	if sandbox.Status.Placement.FastletName == "" {
-		return true, nil
+	envelope, err := assignment.AssignmentFromAnnotation(sandbox)
+	if err != nil {
+		return false, err
+	}
+	if envelope == nil {
+		// Status-only placement is not sufficient proof of an absent runtime.
+		_, err := assignment.EffectiveAssignment(sandbox)
+		return err == nil, err
+	}
+	// Deletion must also work before status is populated or when its projection
+	// lags a candidate switch. Repair only the projection, not the assignment.
+	projected, err := assignment.ProjectAssignmentToStatus(ctx, r.Client, client.ObjectKeyFromObject(sandbox))
+	if err != nil {
+		return false, err
+	}
+	if projected.UID != sandbox.UID {
+		return false, assignment.ErrAssignmentAnnotationChanged
+	}
+	*sandbox = *projected
+	// Always send Delete before Inspect, even if a Create has not arrived yet.
+	// Fastlet records a tombstone that fences a delayed Create for this identity.
+	if err := orchestrator.DeleteRuntime(ctx, sandbox); err != nil {
+		if errors.Is(err, orchestration.ErrAssignedFastletUnavailable) {
+			return r.assignedPodLost(ctx, sandbox)
+		}
+		return false, err
 	}
 	gone, inspectErr := orchestrator.RuntimeGone(ctx, sandbox)
 	if gone {
@@ -456,15 +483,7 @@ func (r *SandboxReconciler) ensureRuntimeDeleted(ctx context.Context, orchestrat
 			}
 			return false, inspectErr
 		}
-		if orchestration.IsNotFound(inspectErr) {
-			// Pod-bound model: once the Fastlet Pod identity is gone, all of its
-			// Sandbox runtimes are considered gone and cannot be taken over.
-			return true, nil
-		}
 		return false, inspectErr
-	}
-	if err := orchestrator.DeleteRuntime(ctx, sandbox); err != nil && !orchestration.IsNotFound(err) {
-		return false, err
 	}
 	return false, nil
 }

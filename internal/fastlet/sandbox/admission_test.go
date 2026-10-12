@@ -125,7 +125,9 @@ func TestInspectUsesProbeInvalidatedActionStatusBeforeControllerProjection(t *te
 	var liveStatuses []fastletapi.ActionBindingStatus
 	require.Eventually(t, func() bool {
 		liveStatuses, _ = actionManager.Statuses("uid-a")
-		return len(liveStatuses) == 1 && liveStatuses[0].State != "Ready"
+		// The blocked replay keeps Applying stable while Inspect reads it;
+		// Pending may advance between the two reads.
+		return len(liveStatuses) == 1 && liveStatuses[0].State == "Applying"
 	}, 2*time.Second, 10*time.Millisecond)
 
 	inspected, err := manager.InspectSandbox(&fastletapi.InspectSandboxRequest{Identity: fastletapi.SandboxIdentity{
@@ -972,4 +974,19 @@ func TestWarmImagesAreAsynchronousAndProtectedFromEviction(t *testing.T) {
 	require.ElementsMatch(t, []string{"alpine:latest", "ubuntu:24.04"}, runtime.pulledImages)
 	runtime.mu.Unlock()
 	require.Equal(t, []string{"cold:1"}, manager.PlanCacheEviction([]string{"ubuntu:24.04", "cold:1", "alpine:latest"}))
+}
+
+func TestDeleteBeforeCreateFencesDelayedAdmission(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	manager := newAdmissionManager(t, runtime, 1)
+	request := ensureRequest("sandbox-a", 1, 1)
+	_, err := manager.DeleteSandbox(&fastletapi.DeleteSandboxRequest{Identity: request.Identity})
+	require.NoError(t, err)
+	_, err = manager.CreateSandbox(context.Background(), request)
+	requireFastletCode(t, err, fastletapi.ErrorGenerationFenced)
+	creates, deletes := runtime.counts()
+	require.Zero(t, creates)
+	require.Zero(t, deletes)
+	admission, _, _ := manager.State()
+	require.Zero(t, admission.Used)
 }

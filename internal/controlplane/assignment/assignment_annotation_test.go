@@ -171,3 +171,67 @@ func TestCASAssignmentRejectsMissingAuthoritativeAnnotation(t *testing.T) {
 		})
 	}
 }
+
+func TestDeletingSandboxCannotAcquireOrSwitchAssignment(t *testing.T) {
+	for _, initial := range []bool{true, false} {
+		t.Run(map[bool]string{true: "initialize", false: "switch"}[initial], func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+			sandbox := &apiv1alpha2.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: "deleting", Namespace: "default", UID: "uid-a", Finalizers: []string{CleanupFinalizer}}}
+			first := testAssignmentEnvelope()
+			if !initial {
+				require.NoError(t, SetAssignmentAnnotation(sandbox, first))
+			}
+			base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sandbox).Build()
+			require.NoError(t, base.Delete(context.Background(), sandbox))
+			key := client.ObjectKeyFromObject(sandbox)
+			if initial {
+				_, _, err := InitializeAssignmentAnnotation(context.Background(), base, key, first)
+				require.ErrorIs(t, err, ErrSandboxDeleting)
+			} else {
+				next := first
+				next.Attempt++
+				_, err := CASAssignmentAnnotation(context.Background(), base, key, first, next)
+				require.ErrorIs(t, err, ErrSandboxDeleting)
+			}
+		})
+	}
+}
+
+type deletionRaceClient struct {
+	client.Client
+	injected bool
+}
+
+func (c *deletionRaceClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+	if !c.injected {
+		c.injected = true
+		var current apiv1alpha2.Sandbox
+		if err := c.Client.Get(ctx, client.ObjectKeyFromObject(object), &current); err != nil {
+			return err
+		}
+		if err := c.Client.Delete(ctx, &current); err != nil {
+			return err
+		}
+	}
+	return c.Client.Patch(ctx, object, patch, options...)
+}
+
+func TestAssignmentSwitchCannotCrossConcurrentDeletion(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	first := testAssignmentEnvelope()
+	sandbox := &apiv1alpha2.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: "deleting", Namespace: "default", UID: "uid-a", Finalizers: []string{CleanupFinalizer}}}
+	require.NoError(t, SetAssignmentAnnotation(sandbox, first))
+	base := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sandbox).Build()
+	next := first
+	next.Attempt++
+	next.FastletName = "fastlet-b"
+	_, err := CASAssignmentAnnotation(context.Background(), &deletionRaceClient{Client: base}, client.ObjectKeyFromObject(sandbox), first, next)
+	require.ErrorIs(t, err, ErrSandboxDeleting)
+	var current apiv1alpha2.Sandbox
+	require.NoError(t, base.Get(context.Background(), client.ObjectKeyFromObject(sandbox), &current))
+	got, err := AssignmentFromAnnotation(&current)
+	require.NoError(t, err)
+	require.Equal(t, first, *got)
+}

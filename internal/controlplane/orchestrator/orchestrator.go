@@ -495,7 +495,7 @@ func (o *Orchestrator) DeleteRuntime(ctx context.Context, sandbox *apiv1alpha2.S
 func (o *Orchestrator) RuntimeGone(ctx context.Context, sandbox *apiv1alpha2.Sandbox) (bool, error) {
 	fastlet, _, identity, err := o.assignedTarget(sandbox)
 	if err != nil {
-		return errors.Is(err, ErrAssignedFastletUnavailable), err
+		return false, err
 	}
 	response, err := o.FastletClient.InspectSandbox(ctx, fastlet.PodIP, &fastletapi.InspectSandboxRequest{Identity: identity})
 	if err != nil {
@@ -505,7 +505,10 @@ func (o *Orchestrator) RuntimeGone(ctx context.Context, sandbox *apiv1alpha2.San
 		}
 		return false, err
 	}
-	return response == nil || response.Sandbox == nil, nil
+	if response == nil || response.Sandbox == nil {
+		return false, ErrUnknownFastletOutcome
+	}
+	return false, nil
 }
 
 func (o *Orchestrator) ClearAssignment(ctx context.Context, sandbox *apiv1alpha2.Sandbox, advanceInstance bool) (*apiv1alpha2.Sandbox, error) {
