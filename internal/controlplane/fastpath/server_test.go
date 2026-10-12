@@ -55,6 +55,7 @@ func (r *fastpathRegistry) RecordFeedback(id placement.FastletID, _ placement.Lo
 
 type fastpathFastlet struct {
 	mu             sync.Mutex
+	beforeCreate   func(*fastletapi.CreateSandboxRequest)
 	createFailure  error
 	createFailures map[string]error
 	createRequests []*fastletapi.CreateSandboxRequest
@@ -71,6 +72,9 @@ type fastpathFastlet struct {
 func (f *fastpathFastlet) CreateSandbox(_ context.Context, fastletIP string, request *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.beforeCreate != nil {
+		f.beforeCreate(request)
+	}
 	f.createRequests = append(f.createRequests, request)
 	f.createIPs = append(f.createIPs, fastletIP)
 	if f.createFailure != nil {
@@ -415,7 +419,9 @@ func TestNoCandidateAndExplicitRejection(t *testing.T) {
 	_, err = server.CreateSandbox(context.Background(), createRequest("rejected"))
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	var persisted apiv1alpha2.Sandbox
-	require.Error(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "rejected"}, &persisted))
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "rejected"}, &persisted))
+	require.NotNil(t, persisted.DeletionTimestamp)
+	require.Contains(t, persisted.Finalizers, assignment.CleanupFinalizer, "rejected intent remains protected until fenced cleanup converges")
 }
 
 func TestExplicitRejectionCASesToSecondCandidate(t *testing.T) {
@@ -792,4 +798,44 @@ func TestResumeSandboxRequiresCheckpointAndFences(t *testing.T) {
 
 	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "paused-a"}, &current))
 	require.Equal(t, apiv1alpha2.SandboxStateRunning, current.Spec.State)
+}
+
+func TestFastPathPersistsCleanupFinalizerBeforeRuntimeCreate(t *testing.T) {
+	server, k8sClient, _, fastlet := newV2Server(t)
+	fastlet.beforeCreate = func(request *fastletapi.CreateSandboxRequest) {
+		var persisted apiv1alpha2.Sandbox
+		require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: request.Identity.Namespace, Name: request.Identity.Name}, &persisted))
+		require.Contains(t, persisted.Finalizers, assignment.CleanupFinalizer)
+	}
+	_, err := server.CreateSandbox(context.Background(), createRequest("protected-create"))
+	require.NoError(t, err)
+	var sandbox apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "protected-create"}, &sandbox))
+	require.Contains(t, sandbox.Finalizers, assignment.CleanupFinalizer)
+	require.Len(t, fastlet.createRequests, 1)
+	// Delete before the Controller has ever reconciled: the intent must survive.
+	require.NoError(t, k8sClient.Delete(context.Background(), &sandbox))
+	require.NoError(t, k8sClient.Get(context.Background(), client.ObjectKeyFromObject(&sandbox), &sandbox))
+	require.NotNil(t, sandbox.DeletionTimestamp)
+	_, err = server.CreateSandbox(context.Background(), createRequest("protected-create"))
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Len(t, fastlet.createRequests, 1, "a deleting intent must not be reprovisioned")
+}
+
+func TestIdempotentCreateProtectsIntentWrittenByOlderServer(t *testing.T) {
+	server, k8sClient, _, fastlet := newV2Server(t)
+	request := createRequest("legacy-intent")
+	_, err := server.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+	var current apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: request.RequestId}, &current))
+	current.Finalizers = nil
+	require.NoError(t, k8sClient.Update(context.Background(), &current))
+	fastlet.beforeCreate = func(req *fastletapi.CreateSandboxRequest) {
+		var persisted apiv1alpha2.Sandbox
+		require.NoError(t, k8sClient.Get(context.Background(), client.ObjectKeyFromObject(&current), &persisted))
+		require.Contains(t, persisted.Finalizers, assignment.CleanupFinalizer)
+	}
+	_, err = server.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
 }
