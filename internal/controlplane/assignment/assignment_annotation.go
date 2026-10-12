@@ -198,22 +198,31 @@ func EffectiveAssignment(sandbox *apiv1alpha2.Sandbox) (*AssignmentEnvelope, err
 	if err != nil {
 		return nil, err
 	}
+	if err := validateStatusProjection(sandbox, envelope); err != nil {
+		return nil, err
+	}
+	return envelope, nil
+}
+
+// Both reads and CAS validate the same projection against an already parsed
+// annotation; CAS must compare the authoritative fence before this check.
+func validateStatusProjection(sandbox *apiv1alpha2.Sandbox, envelope *AssignmentEnvelope) error {
 	if envelope == nil {
 		if sandbox.Status.Placement.FastletName != "" {
-			return nil, ErrAssignmentAnnotationMissing
+			return ErrAssignmentAnnotationMissing
 		}
-		return nil, nil //nolint:nilnil // a Sandbox with no assignment annotation and empty placement is a valid unassigned state
+		return nil
 	}
 	if sandbox.Status.Placement.FastletName == "" {
-		return envelope, nil
+		return nil
 	}
 	want := envelope.StatusPlacement()
 	if !placementsEqual(sandbox.Status.Placement, want) ||
 		sandbox.Status.Runtime.Generation != envelope.InstanceGeneration ||
 		sandbox.Status.DataPlane.RouteGeneration != envelope.RouteGeneration {
-		return nil, ErrAssignmentProjectionConflict
+		return ErrAssignmentProjectionConflict
 	}
-	return envelope, nil
+	return nil
 }
 
 func assignmentEnvelopeEqual(left, right AssignmentEnvelope) bool {
@@ -247,11 +256,22 @@ func CASAssignmentAnnotation(
 		if current.DeletionTimestamp != nil {
 			return ErrSandboxDeleting
 		}
-		currentEnvelope, err := EffectiveAssignment(&current)
+		// A changed authoritative annotation is not a delayed status projection.
+		// Recheck the complete fence before status on every conflict retry.
+		annotated, err := AssignmentFromAnnotation(&current)
 		if err != nil {
 			return err
 		}
-		if currentEnvelope == nil || !assignmentEnvelopeEqual(*currentEnvelope, expected) {
+		if annotated != nil && !assignmentEnvelopeEqual(*annotated, expected) {
+			return ErrAssignmentAnnotationChanged
+		}
+		if err := validateStatusProjection(&current, annotated); err != nil {
+			return fmt.Errorf("%w: annotation attempt=%d instanceGeneration=%d routeGeneration=%d; status fastlet=%s podUID=%s attempt=%d instanceGeneration=%d routeGeneration=%d",
+				err, expected.Attempt, expected.InstanceGeneration, expected.RouteGeneration,
+				current.Status.Placement.FastletName, current.Status.Placement.FastletPodUID,
+				current.Status.Placement.Attempt, current.Status.Runtime.Generation, current.Status.DataPlane.RouteGeneration)
+		}
+		if annotated == nil {
 			return ErrAssignmentAnnotationChanged
 		}
 		before := current.DeepCopy()

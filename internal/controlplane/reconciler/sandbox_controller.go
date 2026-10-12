@@ -103,7 +103,9 @@ func sandboxObservabilityIdentity(sandbox *apiv1alpha2.Sandbox) observability.Id
 }
 
 func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox) (ctrl.Result, error) { //nolint:gocognit // pre-existing reconcile state machine; refactor tracked separately
-	if sandbox.Status.Placement.FastletName != "" {
+	// During an active create, status may still name a rejected candidate.
+	// Project the durable assignment before interpreting that Pod's loss.
+	if sandbox.Status.Placement.FastletName != "" && !orchestrator.FastPathCreateActive(client.ObjectKeyFromObject(sandbox)) {
 		lost, err := r.assignedPodLost(ctx, sandbox)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -135,6 +137,12 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *o
 			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 		}
 		return ctrl.Result{}, err
+	}
+
+	// Keep the status projection above available to the active Fast-Path CAS,
+	// but let that RPC own runtime calls and candidate switches until it exits.
+	if orchestrator.FastPathCreateActive(client.ObjectKeyFromObject(assigned)) {
+		return ctrl.Result{RequeueAfter: ObservationPollInterval}, nil
 	}
 
 	var observed *fastletapi.SandboxStatus
