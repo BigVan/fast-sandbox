@@ -365,7 +365,15 @@ func TestDeviceAttachmentReleasesOnce(t *testing.T) {
 		return nil
 	}
 	undo := &rollback{}
-	attachment := attachDevice(5, "/dev/ublkb5", release, undo)
+	attachment := trackDevice("/config", release, func(context.Context, string) error {
+		t.Fatal("config recovery must not run after a confirmed delete")
+		return nil
+	}, undo)
+	if err := attachment.add(context.Background(), func(context.Context, string) (int, string, error) {
+		return 5, "/dev/ublkb5", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := attachment.detach(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -377,6 +385,61 @@ func TestDeviceAttachmentReleasesOnce(t *testing.T) {
 	if fmt.Sprint(released) != "[5]" {
 		t.Fatalf("released = %v, want exactly one release", released)
 	}
+}
+
+func TestDeviceAttachmentRecoversUncertainResponsesByConfig(t *testing.T) {
+	t.Run("add response lost", func(t *testing.T) {
+		var recovered string
+		undo := &rollback{}
+		attachment := trackDevice("/work/rootfs.config.v1.json", func(context.Context, int) error {
+			t.Fatal("an unknown dev_id must not be deleted")
+			return nil
+		}, func(_ context.Context, config string) error {
+			recovered = config
+			return nil
+		}, undo)
+		if err := attachment.add(context.Background(), func(context.Context, string) (int, string, error) {
+			return 0, "", errors.New("EOF")
+		}); err == nil {
+			t.Fatal("add must report the lost response")
+		}
+		if err := undo.run(); err != nil {
+			t.Fatal(err)
+		}
+		if recovered != attachment.config || attachment.attached {
+			t.Fatalf("recovered = %q, attachment = %+v", recovered, attachment)
+		}
+	})
+
+	t.Run("del response lost", func(t *testing.T) {
+		var deleted []int
+		var recovered string
+		undo := &rollback{}
+		attachment := trackDevice("/work/rootfs.config.v1.json", func(_ context.Context, devID int) error {
+			deleted = append(deleted, devID)
+			return errors.New("EOF")
+		}, func(_ context.Context, config string) error {
+			recovered = config
+			return nil
+		}, undo)
+		if err := attachment.add(context.Background(), func(context.Context, string) (int, string, error) {
+			return 5, "/dev/ublkb5", nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := attachment.detach(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if fmt.Sprint(deleted) != "[5]" || recovered != attachment.config {
+			t.Fatalf("deleted = %v, recovered = %q", deleted, recovered)
+		}
+		if err := undo.run(); err != nil {
+			t.Fatal(err)
+		}
+		if fmt.Sprint(deleted) != "[5]" {
+			t.Fatalf("possibly recycled dev_id deleted twice: %v", deleted)
+		}
+	})
 }
 
 func TestOverlaybdCredentialsRekeysForBlobURL(t *testing.T) {

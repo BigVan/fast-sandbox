@@ -146,6 +146,17 @@ func stopFirecracker(recorded *processRecord, apiSocket string) error {
 	return terminateProcess(*target, firecrackerStopGrace)
 }
 
+// releaseOwnedDevicesByConfig lists the daemon's current devices and releases
+// only those whose config ownership identity matches. It is safe after an Add
+// or Del response is lost because it never trusts a possibly recycled dev_id.
+func releaseOwnedDevicesByConfig(ctx context.Context, ublkd deviceReleaser, config string) error {
+	devices, err := ublkd.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list ublkd devices for config %s: %w", config, err)
+	}
+	return releaseOwnedDevices(ctx, ublkd, devices, config)
+}
+
 // releaseOwnedDevices detaches every device ublkd lists under config. A
 // recorded dev_id is never deleted blindly: once released, the id can be
 // reused by another sandbox's device.
