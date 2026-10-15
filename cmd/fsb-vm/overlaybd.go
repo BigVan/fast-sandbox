@@ -149,7 +149,7 @@ func probeSourceVirtualSize(ctx context.Context, ublkd *ublkdClient, workDir str
 	}
 	// Track config ownership before Add: if the daemon creates the probe but
 	// its response is lost, rollback finds it by config before deleting lowers.
-	probe := trackDevice(configPath, ublkd.Del, func(ctx context.Context, config string) error {
+	probe := trackDevice(configPath, ublkd.Del, func(ctx context.Context, config string) (int, error) {
 		return releaseOwnedDevicesByConfig(ctx, ublkd, config)
 	}, undo)
 	if err := probe.add(ctx, ublkd.Add); err != nil {

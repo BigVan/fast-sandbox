@@ -261,7 +261,7 @@ type buildRootfsOps struct {
 	writeConfig      func(context.Context, string, fetchedImage, int) (string, error)
 	addDevice        func(context.Context, string) (int, string, error)
 	deleteDevice     func(context.Context, int) error
-	recoverDevice    func(context.Context, string) error
+	recoverDevice    func(context.Context, string) (int, error)
 	repairFilesystem func(context.Context, string) error
 	resizeFilesystem func(context.Context, string, int) error
 	verifyFilesystem func(context.Context, string) error
@@ -278,7 +278,7 @@ func newBuildRootfsOps(ublkd *ublkdClient) buildRootfsOps {
 		writeConfig:  writeBuildRootfsConfig,
 		addDevice:    ublkd.Add,
 		deleteDevice: ublkd.Del,
-		recoverDevice: func(ctx context.Context, config string) error {
+		recoverDevice: func(ctx context.Context, config string) (int, error) {
 			return releaseOwnedDevicesByConfig(ctx, ublkd, config)
 		},
 		repairFilesystem: repairExt4,
@@ -296,15 +296,16 @@ func newBuildRootfsOps(ublkd *ublkdClient) buildRootfsOps {
 // lists devices and matches the config path before deleting, so a recycled id
 // can never identify another build's device.
 type deviceAttachment struct {
-	config       string
-	devID        int
-	devPath      string
-	attached     bool
-	release      func(context.Context, int) error
-	recoverOwned func(context.Context, string) error
+	config            string
+	devID             int
+	devPath           string
+	attached          bool
+	addOutcomeUnknown bool
+	release           func(context.Context, int) error
+	recoverOwned      func(context.Context, string) (int, error)
 }
 
-func trackDevice(config string, release func(context.Context, int) error, recoverOwned func(context.Context, string) error, undo *rollback) *deviceAttachment {
+func trackDevice(config string, release func(context.Context, int) error, recoverOwned func(context.Context, string) (int, error), undo *rollback) *deviceAttachment {
 	attachment := &deviceAttachment{config: config, devID: -1, release: release, recoverOwned: recoverOwned}
 	undo.pushDescribed(attachment.String, func() error {
 		return attachment.detach(context.Background())
@@ -317,10 +318,12 @@ func trackDevice(config string, release func(context.Context, int) error, recove
 // device by config before any backing files are removed.
 func (attachment *deviceAttachment) add(ctx context.Context, add func(context.Context, string) (int, string, error)) error {
 	attachment.attached = true
+	attachment.addOutcomeUnknown = false
 	attachment.devID = -1
 	attachment.devPath = ""
 	devID, devPath, err := add(ctx, attachment.config)
 	if err != nil {
+		attachment.addOutcomeUnknown = errors.Is(err, errAddOutcomeUnknown)
 		return err
 	}
 	attachment.devID = devID
@@ -343,6 +346,7 @@ func (attachment *deviceAttachment) detach(ctx context.Context) error {
 	if attachment.devID >= 0 {
 		if releaseErr = attachment.release(ctx, attachment.devID); releaseErr == nil {
 			attachment.attached = false
+			attachment.addOutcomeUnknown = false
 			return nil
 		}
 		// Del may have succeeded despite a lost response. Do not retry a dev_id
@@ -350,10 +354,15 @@ func (attachment *deviceAttachment) detach(ctx context.Context) error {
 		attachment.devID = -1
 		attachment.devPath = ""
 	}
-	if err := attachment.recoverOwned(ctx, attachment.config); err != nil {
+	matches, err := attachment.recoverOwned(ctx, attachment.config)
+	if err != nil {
 		return errors.Join(releaseErr, err)
 	}
+	if attachment.addOutcomeUnknown && matches == 0 {
+		return errors.Join(releaseErr, fmt.Errorf("ublkd add of %s may still be in flight; keeping its backing files", attachment.config))
+	}
 	attachment.attached = false
+	attachment.addOutcomeUnknown = false
 	return nil
 }
 
@@ -647,7 +656,7 @@ func captureSnapfiles(ctx context.Context, ublkd *ublkdClient, options *buildOpt
 	if err != nil {
 		return err
 	}
-	snapfiles := trackDevice(snapConfig, ublkd.Del, func(ctx context.Context, config string) error {
+	snapfiles := trackDevice(snapConfig, ublkd.Del, func(ctx context.Context, config string) (int, error) {
 		return releaseOwnedDevicesByConfig(ctx, ublkd, config)
 	}, undo)
 	if err := snapfiles.add(ctx, ublkd.Add); err != nil {

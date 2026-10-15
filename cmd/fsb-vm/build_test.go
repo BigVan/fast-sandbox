@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -488,8 +489,8 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 			writeConfig:     func(context.Context, string, fetchedImage, int) (string, error) { return "config", nil },
 			addDevice:       func(context.Context, string) (int, string, error) { return 2, "/dev/old", nil },
 			deleteDevice:    func(context.Context, int) error { return errors.New("delete response lost") },
-			recoverDevice: func(context.Context, string) error {
-				return errors.New("device busy")
+			recoverDevice: func(context.Context, string) (int, error) {
+				return 0, errors.New("device busy")
 			},
 			repairFilesystem: func(context.Context, string) error { return errors.New("repair failed") },
 		}
@@ -518,11 +519,13 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 		ops := buildRootfsOps{
 			probeSourceSize: func(context.Context, string, fetchedImage, *rollback) (int64, error) { return 20 << 30, nil },
 			writeConfig:     func(context.Context, string, fetchedImage, int) (string, error) { return config, nil },
-			addDevice:       func(context.Context, string) (int, string, error) { return 0, "", errors.New("EOF") },
-			deleteDevice:    func(context.Context, int) error { return nil },
-			recoverDevice: func(_ context.Context, ownedConfig string) error {
+			addDevice: func(context.Context, string) (int, string, error) {
+				return 0, "", fmt.Errorf("%w: EOF", errAddOutcomeUnknown)
+			},
+			deleteDevice: func(context.Context, int) error { return nil },
+			recoverDevice: func(_ context.Context, ownedConfig string) (int, error) {
 				recovered = ownedConfig
-				return nil
+				return 1, nil
 			},
 		}
 		undo := &rollback{}
@@ -550,9 +553,11 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 		ops := buildRootfsOps{
 			probeSourceSize: func(context.Context, string, fetchedImage, *rollback) (int64, error) { return 20 << 30, nil },
 			writeConfig:     func(context.Context, string, fetchedImage, int) (string, error) { return config, nil },
-			addDevice:       func(context.Context, string) (int, string, error) { return 0, "", errors.New("EOF") },
-			deleteDevice:    func(context.Context, int) error { return nil },
-			recoverDevice:   func(context.Context, string) error { return errors.New("ublkd unavailable") },
+			addDevice: func(context.Context, string) (int, string, error) {
+				return 0, "", fmt.Errorf("%w: EOF", errAddOutcomeUnknown)
+			},
+			deleteDevice:  func(context.Context, int) error { return nil },
+			recoverDevice: func(context.Context, string) (int, error) { return 0, nil },
 		}
 		undo := &rollback{}
 		undo.push("work dir "+workDir, func() error { return os.RemoveAll(workDir) })
@@ -560,7 +565,7 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 			t.Fatal("prepare must fail")
 		}
 		err := undo.run()
-		if err == nil || !strings.Contains(err.Error(), "ublkd unavailable") || !strings.Contains(err.Error(), "work dir "+workDir) {
+		if err == nil || !strings.Contains(err.Error(), "may still be in flight") || !strings.Contains(err.Error(), "work dir "+workDir) {
 			t.Fatalf("rollback error = %v", err)
 		}
 		if _, err := os.Stat(workDir); err != nil {
